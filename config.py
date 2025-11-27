@@ -91,7 +91,7 @@ class Settings(BaseSettings):
     CLEAR_GPU_CACHE: bool = True
 
     # ===== Commentary System =====
-    REDIS_URL: str = "redis://localhost:6379"
+    REDIS_URL: str = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
     RAPIDAPI_KEY: Optional[str] = None  # Legacy: single key (for backward compatibility)
     RAPIDAPI_KEYS: Optional[str] = None  # Comma-separated list of API keys (e.g., "key1,key2,key3")
     RAPIDAPI_HOST: str = "cricbuzz-cricket.p.rapidapi.com"
