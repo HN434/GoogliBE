@@ -9,6 +9,7 @@ import json
 import logging
 from datetime import datetime
 from config import settings
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +22,7 @@ class RedisService:
     - Pub/Sub channels for broadcasting commentary
     """
 
-    def __init__(self, redis_url: str = "redis://localhost:6379"):
+    def __init__(self, redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6379")):
         """
         Initialize Redis service
         
