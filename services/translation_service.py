@@ -28,7 +28,7 @@ class BedrockTranslationService:
         region: str,
         temperature: float = 0.2,
         top_p: float = 0.9,
-        max_tokens: int = 1024,
+        max_tokens: int = 10240,
     ):
         self.model_id = model_id
         self.temperature = temperature

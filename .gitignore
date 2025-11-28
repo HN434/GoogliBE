@@ -18,3 +18,5 @@ start_server.bat
 test_pipeline.py
 
 yolov8n-pose.pt
+
+__googli__/
