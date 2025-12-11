@@ -14,9 +14,10 @@ from sqlalchemy import (
     Index,
 )
 from sqlalchemy.orm import relationship, foreign
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import UUID, JSONB, ENUM
 from datetime import datetime
 import uuid
+import enum
 
 from database.connection import Base
 
@@ -115,4 +116,111 @@ class Commentary(Base):
         Index("idx_commentary_event_type", "event_type"),
         Index("idx_commentary_over_ball", "over_number", "ball_number"),
         Index("idx_commentary_created", "created_at"),
+    )
+
+
+class VideoStatus(str, enum.Enum):
+    """Video processing status enum"""
+    UPLOADED = "uploaded"
+    QUEUED = "queued"
+    PROCESSING = "processing"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+class Video(Base):
+    """
+    Video information table
+    Stores video metadata, S3 paths, and processing status
+    """
+
+    __tablename__ = "videos"
+
+    # Primary key
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    # Timestamps
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    # Storage configuration
+    storage_type = Column(String(20), default="local", nullable=False, comment="Storage type: 'local' or 's3'")
+    # S3 storage paths (bucket stored separately in config for IAM flexibility)
+    s3_raw_key = Column(String(512), nullable=True, comment="S3 key path to original uploaded video (if using S3)")
+    s3_bucket = Column(String(255), nullable=True, comment="S3 bucket name (stored for reference, can be changed via IAM)")
+    # Local storage path
+    local_file_path = Column(String(512), nullable=True, comment="Local file system path to video (if using local storage)")
+
+    # Upload metadata
+    content_type = Column(String(100), nullable=True, comment="MIME type of uploaded video")
+    raw_size_bytes = Column(Integer, nullable=True, comment="Size of uploaded video in bytes")
+
+    # Video metadata (extracted during ingest)
+    duration_seconds = Column(Float, nullable=True, comment="Video duration in seconds")
+    original_fps = Column(Float, nullable=True, comment="Original video FPS")
+    width = Column(Integer, nullable=True, comment="Video width in pixels")
+    height = Column(Integer, nullable=True, comment="Video height in pixels")
+
+    # Thumbnail
+    thumbnail_s3_key = Column(String(512), nullable=True, comment="S3 key path to thumbnail image")
+
+    # Processing status
+    status = Column(
+        ENUM(
+            VideoStatus,
+            name="video_status",
+            create_type=False,
+            # Ensure PostgreSQL enum values use the Enum *values* (e.g. "uploaded")
+            # instead of the Enum names (e.g. "UPLOADED"), to match the existing DB type
+            values_callable=lambda enum_cls: [member.value for member in enum_cls],
+        ),
+        default=VideoStatus.UPLOADED,
+        nullable=False,
+        index=True,
+        comment="Processing pipeline state"
+    )
+
+    # Job tracking
+    queue_job_id = Column(String(255), nullable=True, index=True, comment="Queue job identifier")
+    worker_id = Column(String(255), nullable=True, comment="Worker instance identifier")
+    progress_percent = Column(Integer, default=0, nullable=False, comment="Processing progress (0-100)")
+    error_message = Column(Text, nullable=True, comment="Error message if processing failed")
+
+    # Output paths
+    keypoints_s3_key = Column(String(512), nullable=True, comment="S3 key path to keypoints JSON file")
+    keypoints_local_path = Column(String(512), nullable=True, comment="Local path to keypoints JSON file (if using local storage)")
+    overlay_video_s3_key = Column(String(512), nullable=True, comment="S3 key path to overlay MP4 video")
+    overlay_video_local_path = Column(String(512), nullable=True, comment="Local path to overlay MP4 video (if using local storage)")
+    # Binary format for analysis data (compressed/msgpack)
+    analysis_binary_path = Column(String(512), nullable=True, comment="Path to binary-encoded analysis data (msgpack/compressed)")
+
+    # Inline data (only for small videos)
+    keypoints_jsonb = Column(JSONB, nullable=True, comment="Inline keypoints JSON (only for small videos)")
+
+    # Metrics and analysis
+    metrics_jsonb = Column(JSONB, nullable=True, comment="Aggregated metrics (contact_frame, max_bat_speed, avg_knee_angle, etc.)")
+
+    # Analysis metadata
+    analysis_model = Column(String(255), nullable=True, comment="Model used for analysis")
+    analysis_model_version = Column(String(100), nullable=True, comment="Model version")
+    analysis_fps = Column(Float, nullable=True, comment="FPS used during analysis")
+
+    # Output options
+    output_options = Column(JSON, nullable=True, comment="Requested output options (keypoints, overlay, both)")
+
+    # Retention
+    retention_expires_at = Column(DateTime, nullable=True, index=True, comment="TTL for S3 cleanup")
+
+    # Integrity
+    checksum = Column(String(64), nullable=True, comment="File checksum for deduplication/integrity")
+
+    # Processing timestamps
+    processing_started_at = Column(DateTime, nullable=True, comment="When processing started")
+    processing_finished_at = Column(DateTime, nullable=True, comment="When processing finished")
+
+    __table_args__ = (
+        Index("idx_video_status", "status"),
+        Index("idx_video_created", "created_at"),
+        Index("idx_video_retention", "retention_expires_at"),
+        Index("idx_video_queue_job", "queue_job_id"),
     )

@@ -10,6 +10,10 @@ from contextlib import asynccontextmanager
 
 from services.redis_service import redis_service
 from services.commentary_service import CommentaryService
+from services.translation_service import (
+    BedrockTranslationService,
+    CommentaryTranslationService,
+)
 from workers.worker_supervisor import WorkerSupervisor
 from ws_manager.connection_manager import WebSocketConnectionManager
 from database.connection import init_db, close_db
@@ -32,12 +36,12 @@ logger = logging.getLogger(__name__)
 commentary_service: CommentaryService = None
 worker_supervisor: WorkerSupervisor = None
 ws_manager: WebSocketConnectionManager = None
+translation_service: CommentaryTranslationService = None
 
 # Create router
 router = APIRouter(prefix="/api/commentary", tags=["Commentary"])
 
 HISTORICAL_COMMENTARY_WINDOW = 20
-
 
 @asynccontextmanager
 async def commentary_lifespan(app=None):
@@ -46,7 +50,7 @@ async def commentary_lifespan(app=None):
     Initializes and cleans up Redis, services, and supervisor
     """
     import time
-    global commentary_service, worker_supervisor, ws_manager
+    global commentary_service, worker_supervisor, ws_manager, translation_service
     
     total_start = time.time()
     logger.info("🚀 Starting commentary system...")
@@ -84,6 +88,30 @@ async def commentary_lifespan(app=None):
         )
         logger.info(f"⏱️  WebSocket manager init took {time.time() - ws_start:.2f}s")
         
+        # Initialize translation services if enabled
+        translation_service = None
+        if settings.is_translation_enabled():
+            try:
+                bedrock_translator = BedrockTranslationService(
+                    model_id=settings.BEDROCK_MODEL_ID,
+                    region=settings.BEDROCK_REGION,
+                    temperature=settings.BEDROCK_TEMPERATURE,
+                    top_p=settings.BEDROCK_TOP_P,
+                    max_tokens=settings.BEDROCK_MAX_TOKENS,
+                )
+                translation_service = CommentaryTranslationService(
+                    redis_service=redis_service,
+                    translator=bedrock_translator,
+                    source_language=settings.COMMENTARY_DEFAULT_LANGUAGE,
+                    cache_ttl_seconds=settings.TRANSLATION_CACHE_TTL_SECONDS,
+                )
+                logger.info("✅ Translation service initialized (Bedrock)")
+            except Exception as exc:
+                logger.error("Failed to initialize translation service: %s", exc, exc_info=True)
+                translation_service = None
+        else:
+            logger.info("Commentary translation disabled via configuration")
+
         # Initialize worker supervisor with WebSocket manager reference
         supervisor_start = time.time()
         worker_supervisor = WorkerSupervisor(
@@ -92,6 +120,7 @@ async def commentary_lifespan(app=None):
             cleanup_interval=settings.WORKER_CLEANUP_INTERVAL,
             ws_manager=ws_manager,
             enable_historical_commentary=settings.ENABLE_HISTORICAL_COMMENTARY,
+            translation_service=translation_service,
         )
         
         # Set supervisor reference in WebSocket manager
@@ -230,11 +259,46 @@ def _serialize_api_commentaries(match_id: str, lines: List[CommentaryLine]) -> L
     return serialized
 
 
+async def _maybe_translate_historical_commentaries(
+    match_id: str,
+    language: str,
+    lines: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Translate commentary lines for historical endpoint when needed.
+    """
+    default_lang = (settings.COMMENTARY_DEFAULT_LANGUAGE or "en").lower()
+    if (
+        not lines
+        or language == default_lang
+        or not translation_service
+    ):
+        return lines
+
+    try:
+        translated = await translation_service.translate_lines(
+            match_id,
+            lines,
+            language,
+        )
+        return translated or lines
+    except Exception as exc:
+        logger.error(
+            "Failed to translate historical commentary for match %s (lang=%s): %s",
+            match_id,
+            language,
+            exc,
+            exc_info=True,
+        )
+        return lines
+
+
 @router.get("/matches/{match_id}/comm-previous")
 async def get_historical_commentary(
     match_id: str,
     tms: int = Query(..., description="Target timestamp (ms) to look back from"),
     iid: Optional[int] = Query(None, description="Innings identifier"),
+    language: Optional[str] = Query(None, description="Language code for translated commentary"),
 ):
     """
     Return up to 20 commentary entries before the supplied timestamp.
@@ -248,6 +312,17 @@ async def get_historical_commentary(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
+    language_param = (language or settings.COMMENTARY_DEFAULT_LANGUAGE).lower()
+    supported_languages = settings.get_supported_commentary_languages()
+    if language_param not in supported_languages:
+        logger.warning(
+            "Unsupported language '%s' requested for historical commentary on match %s. Falling back to %s.",
+            language_param,
+            match_id,
+            settings.COMMENTARY_DEFAULT_LANGUAGE,
+        )
+        language_param = settings.COMMENTARY_DEFAULT_LANGUAGE.lower()
+
     db_chain = await db_service.get_linked_commentaries(
         match_id=match_id,
         timestamp=timestamp_dt,
@@ -257,12 +332,14 @@ async def get_historical_commentary(
 
     if len(db_chain) >= HISTORICAL_COMMENTARY_WINDOW:
         lines = _serialize_db_commentaries(list(reversed(db_chain)))
-        lines = [ line for line in lines if line['metadata']['timestamp_ms'] != tms ]
+        lines = [line for line in lines if line["metadata"]["timestamp_ms"] != tms]
+        lines = await _maybe_translate_historical_commentaries(match_id, language_param, lines)
         return {
             "match_id": match_id,
             "innings_id": iid,
             "requested_timestamp": tms,
             "source": "database_chain",
+            "language": language_param,
             "count": len(lines),
             "lines": lines,
         }
@@ -278,12 +355,14 @@ async def get_historical_commentary(
     if lines_from_api:
         await db_service.store_commentaries(match_id, lines_from_api)
         lines = _serialize_api_commentaries(match_id, lines_from_api)
-        lines = [ line for line in lines if line['metadata']['timestamp_ms'] != tms ]
+        lines = [line for line in lines if line["metadata"]["timestamp_ms"] != tms]
+        lines = await _maybe_translate_historical_commentaries(match_id, language_param, lines)
         return {
             "match_id": match_id,
             "innings_id": iid,
             "requested_timestamp": tms,
             "source": "rapidapi",
+            "language": language_param,
             "count": len(lines),
             "lines": lines,
         }
@@ -315,12 +394,14 @@ async def test_message_format():
         match_id="test_match",
         timestamp=datetime.now(),
         lines=[sample_line],
-        match_status="live"
+        match_status="live",
+        language=settings.COMMENTARY_DEFAULT_LANGUAGE
     )
     
     sample_ws_message = WebSocketMessage(
         type="commentary",
         match_id="test_match",
+        language=settings.COMMENTARY_DEFAULT_LANGUAGE,
         data=sample_update.model_dump(mode="json", exclude_none=True)
     )
     
@@ -348,13 +429,28 @@ async def websocket_commentary(websocket: WebSocket, match_id: str):
         await websocket.close(code=503, reason="WebSocket manager not initialized")
         return
     
-    logger.info(f"WebSocket connection request for match {match_id}")
+    language_param = (
+        websocket.query_params.get("language")
+        or websocket.query_params.get("lang")
+        or settings.COMMENTARY_DEFAULT_LANGUAGE
+    )
+    language = (language_param or settings.COMMENTARY_DEFAULT_LANGUAGE).lower()
+    supported_languages = settings.get_supported_commentary_languages()
+    if language not in supported_languages:
+        logger.warning(
+            "Unsupported language '%s' requested for match %s. Falling back to %s.",
+            language,
+            match_id,
+            settings.COMMENTARY_DEFAULT_LANGUAGE,
+        )
+        language = settings.COMMENTARY_DEFAULT_LANGUAGE.lower()
+
+    logger.info(f"WebSocket connection request for match {match_id} (lang={language})")
     try:
-        await ws_manager.handle_websocket(websocket, match_id)
+        await ws_manager.handle_websocket(websocket, match_id, language)
     except Exception as e:
         logger.error(f"Error in WebSocket handler for match {match_id}: {e}", exc_info=True)
         try:
             await websocket.close(code=1011, reason=f"Internal error: {str(e)}")
         except:
             pass
-

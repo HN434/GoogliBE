@@ -29,7 +29,8 @@ class MatchWorker:
         commentary_service: CommentaryService,
         redis_service: RedisService,
         fetch_interval: int = 20,
-        ws_manager=None
+        ws_manager=None,
+        translation_service=None,
     ):
         """
         Initialize match worker
@@ -46,6 +47,7 @@ class MatchWorker:
         self.redis_service = redis_service
         self.fetch_interval = fetch_interval
         self.ws_manager = ws_manager
+        self.translation_service = translation_service
         
         # Track seen commentary keys (match_id + timestamp) to compute deltas
         self.seen_commentary_keys: Set[str] = set()
@@ -57,6 +59,11 @@ class MatchWorker:
         self.task: Optional[asyncio.Task] = None
         self.error_count = 0
         self.last_fetch: Optional[datetime] = None
+        
+        # Track when subscriber count becomes zero to add grace period
+        self.zero_subscribers_since: Optional[datetime] = None
+        self.zero_subscribers_grace_period: int = 5  # seconds to wait before stopping
+        self.in_grace_period: bool = False  # Flag to indicate worker is in shutdown grace period
 
     async def start(self):
         """Start the worker"""
@@ -77,6 +84,7 @@ class MatchWorker:
             return
         
         self.is_running = False
+        self.in_grace_period = False  # Clear grace period when stopping
         await self.redis_service.set_worker_running(self.match_id, False)
         
         # Cancel task if running
@@ -151,11 +159,13 @@ class MatchWorker:
                             timestamp=datetime.now(),
                             lines=[],
                             match_status=status_data.get("status", "finished"),
-                            score=status_data  # Include full status in score field for backward compatibility
+                            score=status_data,  # Include full status in score field for backward compatibility
+                            language=self.redis_service.default_language,
                         )
                         
                         # Add status_data to the update
                         update_dict = final_update.model_dump(mode="json", exclude_none=True)
+                        update_dict["language"] = self.redis_service.default_language
                         update_dict["match_status_info"] = status_data
                         if self.last_miniscore:
                             update_dict["miniscore"] = self.last_miniscore
@@ -165,17 +175,28 @@ class MatchWorker:
                             self.match_id,
                             update_dict
                         )
+                        if self.translation_service:
+                            await self._fan_out_translations(update_dict)
                         logger.info(f"✅ Sent final status message for match {self.match_id}: {status_data.get('status', 'finished')}")
                         
                         # Update match status in database
                         await db_service.update_match_status(self.match_id, status_data)
 
                         # Disconnect all WebSocket clients for this match after sending final message
+                        # Pass worker_id so only THIS worker's connections are disconnected
                         if self.ws_manager:
-                            logger.info(f"Disconnecting WebSocket clients for finished match {self.match_id}")
+                            worker_id = id(self)  # Unique ID for this worker instance
+                            logger.info(
+                                f"Disconnecting WebSocket clients for finished match {self.match_id} "
+                                f"(worker_id={worker_id})"
+                            )
                             # Use asyncio.create_task to not block worker shutdown
                             asyncio.create_task(
-                                self.ws_manager.disconnect_all_for_match(self.match_id, delay_seconds=2.0)
+                                self.ws_manager.disconnect_all_for_match(
+                                    self.match_id, 
+                                    delay_seconds=2.0,
+                                    worker_id=worker_id
+                                )
                             )
                         else:
                             logger.warning(f"WebSocket manager not available, cannot disconnect clients for match {self.match_id}")
@@ -186,13 +207,44 @@ class MatchWorker:
                     await self.stop()
                     break
                 
-                # Check subscriber count
+                # Check subscriber count with grace period to avoid race conditions
                 subscriber_count = await self.redis_service.get_subscriber_count(self.match_id)
                 logger.debug(f"Match {self.match_id} has {subscriber_count} subscribers")
+                
                 if subscriber_count == 0:
-                    logger.info(f"No subscribers for match {self.match_id}. Stopping worker.")
-                    await self.stop()
-                    break
+                    # Track when we first saw zero subscribers
+                    if self.zero_subscribers_since is None:
+                        self.zero_subscribers_since = datetime.now()
+                        self.in_grace_period = True  # Mark as in grace period
+                        logger.info(
+                            f"⏳ No subscribers for match {self.match_id}. "
+                            f"Starting grace period of {self.zero_subscribers_grace_period}s... "
+                            f"(Worker marked as closing - new connections should create new worker)"
+                        )
+                    else:
+                        # Check if grace period has elapsed
+                        elapsed = (datetime.now() - self.zero_subscribers_since).total_seconds()
+                        if elapsed >= self.zero_subscribers_grace_period:
+                            logger.info(
+                                f"⏱️ No subscribers for match {self.match_id} after {elapsed:.1f}s grace period. "
+                                f"Stopping worker."
+                            )
+                            await self.stop()
+                            break
+                        else:
+                            logger.debug(
+                                f"Grace period active for match {self.match_id}: {elapsed:.1f}s / "
+                                f"{self.zero_subscribers_grace_period}s"
+                            )
+                else:
+                    # Reset grace period if we have subscribers again
+                    if self.zero_subscribers_since is not None:
+                        logger.info(
+                            f"🔄 Match {self.match_id} regained subscribers ({subscriber_count}). "
+                            f"Resetting grace period."
+                        )
+                        self.zero_subscribers_since = None
+                        self.in_grace_period = False  # Clear grace period flag
                 
                 # Fetch commentary
                 logger.debug(f"Fetching commentary for match {self.match_id}")
@@ -292,7 +344,8 @@ class MatchWorker:
                 match_id=self.match_id,
                 timestamp=datetime.now(),
                 lines=all_commentary,
-                match_status=match_status_str
+                match_status=match_status_str,
+                language=self.redis_service.default_language,
             )
 
             update_dict = update.model_dump(mode="json", exclude_none=True)
@@ -313,6 +366,9 @@ class MatchWorker:
                 self.match_id,
                 update_dict
             )
+
+            if self.translation_service:
+                await self._fan_out_translations(update_dict)
             
             logger.info(
                 f"✅ Published commentary snapshot for match {self.match_id} "
@@ -341,6 +397,7 @@ class MatchWorker:
         return {
             "match_id": self.match_id,
             "is_running": self.is_running,
+            "in_grace_period": self.in_grace_period,
             "last_fetch": self.last_fetch.isoformat() if self.last_fetch else None,
             "error_count": self.error_count,
             "seen_commentary_count": len(self.seen_commentary_keys)
@@ -374,3 +431,20 @@ class MatchWorker:
             reverse=True
         )
         return sorted_lines[:limit]
+
+    async def _fan_out_translations(self, update_payload: dict):
+        """
+        Translate commentary snapshot for subscribers requesting other languages.
+        """
+        if not self.translation_service:
+            return
+        active_languages = await self.redis_service.get_active_languages(self.match_id)
+        default_lang = self.redis_service.default_language
+        target_languages = [lang for lang in active_languages if lang != default_lang]
+        if not target_languages:
+            return
+        await self.translation_service.translate_and_publish(
+            self.match_id,
+            update_payload,
+            target_languages,
+        )

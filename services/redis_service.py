@@ -9,7 +9,6 @@ import json
 import logging
 from datetime import datetime
 from config import settings
-import os
 
 logger = logging.getLogger(__name__)
 
@@ -19,17 +18,21 @@ class RedisService:
     Redis service for managing:
     - Subscriber tracking (Redis Sets)
     - Worker status (Redis Keys)
-    - Pub/Sub channels for broadcasting commentary
+    - Pub/Sub channels for broadcasting commentary and video analysis
     """
 
-    def __init__(self, redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6379")):
+    def __init__(self, redis_url=None):
         """
         Initialize Redis service
         
         Args:
             redis_url: Redis connection URL
         """
-        self.redis_url = redis_url
+        # Prefer explicit URL from caller; otherwise fall back to settings.REDIS_URL,
+        # then to a sane local default. This ensures all components (API server,
+        # workers) use the same Redis instance when REDIS_URL is configured.
+        effective_url = redis_url or settings.REDIS_URL or "redis://localhost:6379/0"
+        self.redis_url = effective_url
         self.redis_client: Optional[aioredis.Redis] = None
         self.pubsub_client: Optional[aioredis.Redis] = None
         self.default_language = (settings.COMMENTARY_DEFAULT_LANGUAGE or "en").lower()
@@ -47,20 +50,22 @@ class RedisService:
                     self.redis_url,
                     encoding="utf-8",
                     decode_responses=True,
-                    socket_connect_timeout=5,  # 5 second connection timeout
-                    socket_timeout=5,  # 5 second socket timeout
+                    socket_connect_timeout=5,
+                    socket_timeout=600,  # allow long translation calls before timing out
                 ),
                 timeout=10.0  # Overall timeout for connection
             )
             
             # Separate client for pub/sub (required by Redis)
+            # IMPORTANT: use socket_timeout=None so Pub/Sub listeners don't time out
+            # when no messages are received for a while.
             self.pubsub_client = await asyncio.wait_for(
                 aioredis.from_url(
                     self.redis_url,
                     encoding="utf-8",
                     decode_responses=True,
                     socket_connect_timeout=5,
-                    socket_timeout=5,
+                    socket_timeout=None,  # no read timeout for long‑lived subscriptions
                 ),
                 timeout=10.0
             )
@@ -164,11 +169,35 @@ class RedisService:
         """
         lang = self._normalize_language(language)
         key = self._language_subscriber_key(match_id)
+        
+        # Check current count before decrementing to prevent going negative
+        current = await self.redis_client.hget(key, lang)
+        if current is None or int(current) <= 0:
+            # Already at 0 or doesn't exist - don't decrement
+            logger.warning(
+                f"⚠️ Attempted to remove language subscriber for match {match_id}, lang={lang}, "
+                f"but count is already 0 or doesn't exist (current={current}). Skipping duplicate removal."
+            )
+            await self.redis_client.hdel(key, lang)
+            return 0
+        
+        # Decrement (there's a tiny race condition window here, but we handle it below)
         remaining = await self.redis_client.hincrby(key, lang, -1)
-        if remaining <= 0:
+        
+        # Handle any race conditions that caused negative values
+        if remaining < 0:
+            logger.warning(
+                f"⚠️ Language subscriber count went negative for match {match_id}, lang={lang} "
+                f"(remaining={remaining}). Resetting to 0. This indicates a double-removal bug."
+            )
+            # Reset to 0 in Redis
             await self.redis_client.hdel(key, lang)
             remaining = 0
-        logger.debug(f"Language subscriber -1 for match {match_id}, lang={lang}, remaining={remaining}")
+        elif remaining == 0:
+            # Clean up when reaching 0
+            await self.redis_client.hdel(key, lang)
+        
+        logger.debug(f"✅ Language subscriber decremented for match {match_id}, lang={lang}, remaining={remaining}")
         return remaining
 
     async def get_active_languages(self, match_id: str) -> Set[str]:
@@ -284,7 +313,7 @@ class RedisService:
         channel = self._channel_name(match_id, language)
         try:
             # Serialize with proper datetime handling
-            message_json = json.dumps(message, default=str)  # default=str handles datetime serialization
+            message_json = json.dumps(message, default=str, ensure_ascii=False)  # default=str handles datetime serialization
             subscribers = await self.get_subscriber_count(match_id)
             logger.info(f"📢 Publishing to channel {channel} (subscribers: {subscribers})")
             logger.debug(f"Message preview: {str(message)[:200]}...")
@@ -344,6 +373,83 @@ class RedisService:
             except:
                 pass
             logger.info(f"Unsubscribed from channel: {channel}")
+
+    async def publish_video_analysis(self, video_id: str, message: dict):
+        """
+        Publish video analysis update to Redis Pub/Sub channel
+        
+        Args:
+            video_id: Video identifier
+            message: Analysis update message (dict)
+        """
+        channel = f"video:{video_id}:analysis"
+        try:
+            message_json = json.dumps(message, default=str, ensure_ascii=False)
+            logger.info(f"📢 Publishing video analysis to channel {channel}")
+            logger.debug(f"Message preview: {str(message)[:200]}...")
+            
+            result = await self.pubsub_client.publish(channel, message_json)
+            logger.info(f"✅ Published to {channel}, {result} subscribers notified")
+        except Exception as e:
+            logger.error(f"❌ Error publishing to channel {channel}: {e}", exc_info=True)
+            raise
+
+    async def subscribe_to_video_analysis(self, video_id: str) -> AsyncIterator[dict]:
+        """
+        Subscribe to video analysis updates
+        
+        Args:
+            video_id: Video identifier
+            
+        Yields:
+            Analysis update messages as dictionaries
+        """
+        channel = f"video:{video_id}:analysis"
+        
+        # Ensure pubsub_client is available; lazily connect if needed
+        if not self.pubsub_client:
+            logger.info("PubSub client not initialized, connecting to Redis for video analysis subscription")
+            await self.connect()
+
+        pubsub = self.pubsub_client.pubsub()
+        
+        try:
+            # Subscribe to the channel
+            logger.info(f"Subscribing to video analysis channel: {channel}")
+            await pubsub.subscribe(channel)
+            
+            # Listen for messages (including subscription confirmation)
+            async for message in pubsub.listen():
+                # Handle subscription confirmation
+                if message["type"] == "subscribe":
+                    logger.info(f"✅ Successfully subscribed to video analysis channel: {channel}")
+                    continue
+                
+                # Skip non-message types
+                if message["type"] != "message":
+                    logger.debug(f"Received non-message type from {channel}: {message['type']}")
+                    continue
+                
+                # Parse JSON message
+                try:
+                    data = json.loads(message["data"])
+                    logger.debug(f"Parsed message from {channel}: type={data.get('type')}")
+                    yield data
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse message from {channel}: {e}, raw data: {message.get('data', '')[:200]}")
+                    continue
+                    
+        except Exception as e:
+            logger.error(f"Error in subscription to {channel}: {e}", exc_info=True)
+            raise
+        finally:
+            # Unsubscribe and close pubsub when done
+            try:
+                await pubsub.unsubscribe(channel)
+                await pubsub.close()
+                logger.info(f"Unsubscribed from channel: {channel}")
+            except Exception as e:
+                logger.warning(f"Error unsubscribing from {channel}: {e}")
 
     async def unsubscribe_from_match(self, match_id: str):
         """

@@ -179,3 +179,40 @@ class ProcessingConfig(BaseModel):
     enable_short_pitch_detection: Optional[bool] = True
     export_annotated_video: Optional[bool] = True
     export_csv: Optional[bool] = True
+
+
+# ===== Video Upload Models =====
+
+class PresignedUrlRequest(BaseModel):
+    """Request for presigned upload URL"""
+    filename: str = Field(..., description="Original filename")
+    content_type: str = Field(..., description="MIME type (e.g., video/mp4)")
+    file_size_bytes: Optional[int] = Field(None, description="File size in bytes for validation")
+
+
+class PresignedUrlResponse(BaseModel):
+    """Response with presigned upload URL"""
+    video_id: str = Field(..., description="UUID of the video record")
+    upload_url: str = Field(..., description="Presigned URL for PUT request")
+    s3_key: str = Field(..., description="S3 key where file should be uploaded")
+    s3_bucket: str = Field(..., description="S3 bucket name")
+    expires_at: str = Field(..., description="ISO timestamp when URL expires")
+    content_type: str = Field(..., description="Content type for upload")
+
+
+class UploadCompleteRequest(BaseModel):
+    """Request to mark upload as complete"""
+    video_id: str = Field(..., description="UUID of the video record")
+    file_size_bytes: int = Field(..., description="Actual uploaded file size")
+    checksum: Optional[str] = Field(None, description="Optional file checksum for integrity")
+    output_options: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Requested output options (keypoints, overlay, both)"
+    )
+
+
+class UploadCompleteResponse(BaseModel):
+    """Response after marking upload complete"""
+    video_id: str = Field(..., description="UUID of the video record")
+    status: str = Field(..., description="Current video status")
+    message: str = Field(..., description="Status message")

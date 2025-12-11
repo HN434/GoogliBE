@@ -62,8 +62,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Include commentary router
+# Include routers
+# Include routers
 app.include_router(commentary_router)
+from .video_router import router as video_router
+app.include_router(video_router)
+from .chat_router import router as chat_router
+app.include_router(chat_router)
 
 # Configuration
 UPLOAD_DIR = "uploads"

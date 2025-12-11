@@ -10,6 +10,7 @@ from datetime import datetime
 
 from services.video_processor import VideoProcessor, VideoWriter, validate_video_file
 from services.pose_detector import get_pose_detector, create_new_metrics_computer
+from services.bat_detector import get_bat_detector, create_new_bat_detector
 from services.tracker import create_new_tracker
 from services.metrics_computer import create_new_metrics_computer
 from services.event_classifier import create_new_event_classifier
@@ -44,6 +45,7 @@ class ProcessingPipeline:
 
         # Initialize services
         self.pose_detector = get_pose_detector()
+        self.bat_detector = get_bat_detector()
         self.visualizer = get_visualizer()
         self.report_generator = get_report_generator()
 
@@ -53,6 +55,10 @@ class ProcessingPipeline:
         self.event_classifier = None
 
         print("🚀 ProcessingPipeline initialized")
+        if self.bat_detector.enabled:
+            print("   ✅ Bat detection: ENABLED")
+        else:
+            print("   ⚠️  Bat detection: DISABLED")
 
     def process(
         self,
@@ -114,6 +120,7 @@ class ProcessingPipeline:
 
         # Storage for results
         all_pose_data = []
+        all_bat_data = []  # Store bat detections
         active_events = {}  # player_id -> event_label
 
         # Process frames
@@ -132,10 +139,18 @@ class ProcessingPipeline:
 
             # Pose detection
             detections_batch = self.pose_detector.detect_batch(frames)
+            
+            # Bat detection (parallel with pose detection)
+            bat_detections_batch = []
+            if self.bat_detector.enabled:
+                bat_detections_batch = self.bat_detector.detect_batch(frames)
+            else:
+                bat_detections_batch = [[] for _ in frames]
 
             # Process each frame in batch
             for i, (frame_num, frame) in enumerate(batch):
                 detections = detections_batch[i]
+                bat_detections = bat_detections_batch[i]
 
                 # Player tracking
                 tracked_detections = self.tracker.update(detections, frame_num)
@@ -165,6 +180,15 @@ class ProcessingPipeline:
                     detections=enriched_detections
                 )
                 all_pose_data.append(frame_data)
+                
+                # Store bat detection data
+                if bat_detections:
+                    bat_frame_data = {
+                        "frame": frame_num,
+                        "time_seconds": frame_num / video_info.fps,
+                        "bats": [bat.to_dict() for bat in bat_detections]
+                    }
+                    all_bat_data.append(bat_frame_data)
 
                 # Annotate frame
                 if video_writer:
@@ -177,6 +201,13 @@ class ProcessingPipeline:
                         active_events,
                         frame_info
                     )
+                    
+                    # Draw bat detections on top
+                    if bat_detections and self.bat_detector.enabled:
+                        annotated_frame = self.bat_detector.visualize_detections(
+                            annotated_frame,
+                            bat_detections
+                        )
 
                     video_writer.write_frame(annotated_frame)
 
@@ -242,13 +273,18 @@ class ProcessingPipeline:
         # Generate reports
         self._update_progress(90, "Generating reports...")
 
+        # Add bat detection summary to processing metadata
+        if all_bat_data:
+            print(f"🏏 Detected bats in {len(all_bat_data)} frames")
+        
         result = self.report_generator.generate_json_report(
             video_metadata,
             processing_metadata,
             players,
             all_events,
             all_pose_data,
-            str(json_path)
+            str(json_path),
+            bat_data=all_bat_data  # Pass bat detection data
         )
 
         if settings.EXPORT_CSV_TIMESERIES:

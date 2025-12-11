@@ -38,7 +38,8 @@ class ReportGenerator:
         players: List[Player],
         events: List[Event],
         pose_data: List[FramePoseData],
-        output_path: str
+        output_path: str,
+        bat_data: Optional[List[Dict]] = None
     ) -> AnalysisResult:
         """
         Generate comprehensive JSON report
@@ -74,8 +75,14 @@ class ReportGenerator:
 
             with open(output_file, "w") as f:
                 # Convert to dict and write
+                result_dict = result.model_dump()
+                
+                # Add bat detection data if available
+                if bat_data:
+                    result_dict["bat_detections"] = bat_data
+                
                 json.dump(
-                    result.model_dump(),
+                    result_dict,
                     f,
                     indent=2,
                     default=str

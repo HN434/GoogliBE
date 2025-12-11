@@ -32,6 +32,7 @@ class WorkerSupervisor:
         cleanup_interval: int = 60,
         ws_manager=None,
         enable_historical_commentary: bool = False,
+        translation_service=None,
     ):
         """
         Initialize worker supervisor
@@ -47,10 +48,20 @@ class WorkerSupervisor:
         self.cleanup_interval = cleanup_interval
         self.ws_manager = ws_manager
         self.enable_historical_commentary = enable_historical_commentary
+        self.translation_service = translation_service
         
-        # Registry of running workers: match_id -> worker
-        self.workers: Dict[str, MatchWorker] = {}
+        # Registry of active workers: match_id -> worker
+        # Only one active worker per match at a time
+        self.active_workers: Dict[str, MatchWorker] = {}
+        
+        # Track workers that are closing: match_id -> list of workers
+        # Multiple closing workers allowed per match
+        self.closing_workers: Dict[str, list[MatchWorker]] = {}
+        
         self.historical_workers: Dict[str, HistoricalCommentaryWorker] = {}
+        
+        # Locks for worker lifecycle operations to prevent concurrent start/stop
+        self.worker_locks: Dict[str, asyncio.Lock] = {}
         
         # Supervisor state
         self.is_running = False
@@ -85,69 +96,188 @@ class WorkerSupervisor:
             except asyncio.CancelledError:
                 pass
         
-        # Stop all workers
-        stop_tasks = [worker.stop() for worker in self.workers.values()]
+        # Stop all workers (both active and closing)
+        stop_tasks = [worker.stop() for worker in self.active_workers.values()]
+        for closing_list in self.closing_workers.values():
+            stop_tasks.extend([worker.stop() for worker in closing_list])
         stop_tasks += [worker.stop() for worker in self.historical_workers.values()]
         if stop_tasks:
             await asyncio.gather(*stop_tasks, return_exceptions=True)
         
-        self.workers.clear()
+        self.active_workers.clear()
+        self.closing_workers.clear()
         self.historical_workers.clear()
+        self.worker_locks.clear()
         logger.info("🛑 Worker supervisor stopped")
 
     async def ensure_worker(self, match_id: str) -> MatchWorker:
         """
         Ensure a worker is running for a match
-        Creates worker if it doesn't exist, otherwise returns existing worker
+        Creates worker if it doesn't exist, otherwise returns existing active worker
+        
+        If current active worker is stopping, it moves it to closing list and creates a new one.
+        This prevents race conditions when users reconnect during worker cleanup.
         
         Args:
             match_id: Match identifier
         
         Returns:
-            MatchWorker instance
+            Active MatchWorker instance
         """
-        # Return existing worker if already running
-        if match_id in self.workers:
-            worker = self.workers[match_id]
-            if worker.is_running:
-                return worker
-            else:
-                # Worker exists but not running, remove it
-                del self.workers[match_id]
+        # Get or create lock for this match
+        if match_id not in self.worker_locks:
+            self.worker_locks[match_id] = asyncio.Lock()
         
-        # Check if worker should be running (has subscribers)
-        subscriber_count = await self.redis_service.get_subscriber_count(match_id)
-        if subscriber_count == 0:
-            logger.debug(f"No subscribers for match {match_id}, not starting worker")
-            return None
+        async with self.worker_locks[match_id]:
+            # Check if there's an active worker
+            if match_id in self.active_workers:
+                worker = self.active_workers[match_id]
+                
+                # Check if worker is in grace period (shutting down soon)
+                if worker.in_grace_period:
+                    closing_count = len(self.closing_workers.get(match_id, []))
+                    logger.info(
+                        f"⏳ Active worker for match {match_id} is in grace period (shutting down), "
+                        f"moving to closing list ({closing_count} already closing) and creating new worker"
+                    )
+                    self._move_to_closing(match_id, worker)
+                    # Continue to create new worker below
+                
+                # If worker is running and healthy (not in grace period), return it
+                elif worker.is_running:
+                    logger.debug(f"✅ Returning existing active worker for match {match_id}")
+                    return worker
+                else:
+                    # Worker is not running anymore - move it to closing list
+                    closing_count = len(self.closing_workers.get(match_id, []))
+                    logger.info(
+                        f"🔄 Active worker for match {match_id} is not running, "
+                        f"moving to closing list ({closing_count} already closing) and creating new worker"
+                    )
+                    self._move_to_closing(match_id, worker)
+                    # Continue to create new worker below
+            
+            # Check if worker should be running (has subscribers)
+            subscriber_count = await self.redis_service.get_subscriber_count(match_id)
+            if subscriber_count == 0:
+                logger.debug(f"No subscribers for match {match_id}, not starting worker")
+                return None
+            
+            # Create and start new active worker
+            logger.info(f"Creating new active worker for match {match_id} (subscribers: {subscriber_count})")
+            worker = MatchWorker(
+                match_id=match_id,
+                commentary_service=self.commentary_service,
+                redis_service=self.redis_service,
+                ws_manager=self.ws_manager,
+                translation_service=self.translation_service,
+            )
+            
+            # Set as active worker
+            self.active_workers[match_id] = worker
+            await worker.start()
+            
+            logger.info(f"✅ Created and started new active worker for match {match_id}")
+            return worker
+    
+    def _move_to_closing(self, match_id: str, worker: MatchWorker):
+        """
+        Move a worker to the closing list and remove from active
         
-        # Create and start new worker
-        logger.info(f"Creating new worker for match {match_id} (subscribers: {subscriber_count})")
-        worker = MatchWorker(
-            match_id=match_id,
-            commentary_service=self.commentary_service,
-            redis_service=self.redis_service,
-            ws_manager=self.ws_manager,
+        Args:
+            match_id: Match identifier
+            worker: Worker to move to closing
+        """
+        # Remove from active
+        if match_id in self.active_workers and self.active_workers[match_id] == worker:
+            del self.active_workers[match_id]
+        
+        # Add to closing list
+        if match_id not in self.closing_workers:
+            self.closing_workers[match_id] = []
+        self.closing_workers[match_id].append(worker)
+        
+        closing_count = len(self.closing_workers[match_id])
+        
+        # Schedule cleanup of this worker from closing list after it finishes
+        asyncio.create_task(self._cleanup_closed_worker(match_id, worker))
+        
+        logger.info(
+            f"📦 Moved worker for match {match_id} to closing list "
+            f"(total closing for this match: {closing_count})"
         )
+    
+    async def _cleanup_closed_worker(self, match_id: str, worker: MatchWorker):
+        """
+        Wait for a worker to finish closing, then remove it from closing list
         
-        self.workers[match_id] = worker
-        await worker.start()
-        
-        logger.info(f"✅ Created and started worker for match {match_id}")
-        return worker
+        Args:
+            match_id: Match identifier
+            worker: Worker that is closing
+        """
+        try:
+            # Wait for worker to finish (check every second for up to 30 seconds)
+            max_wait = 30
+            waited = 0
+            for i in range(max_wait):
+                if not worker.is_running:
+                    waited = i
+                    break
+                await asyncio.sleep(1)
+            else:
+                # Worker still running after max wait
+                logger.warning(
+                    f"⚠️ Worker for match {match_id} still running after {max_wait}s, "
+                    f"removing from closing list anyway"
+                )
+            
+            # Remove from closing list
+            if match_id in self.closing_workers:
+                if worker in self.closing_workers[match_id]:
+                    self.closing_workers[match_id].remove(worker)
+                    remaining = len(self.closing_workers[match_id])
+                    logger.info(
+                        f"🧹 Cleaned up closed worker for match {match_id} after {waited}s "
+                        f"({remaining} still closing for this match)"
+                    )
+                
+                # Clean up empty list
+                if not self.closing_workers[match_id]:
+                    del self.closing_workers[match_id]
+                    logger.debug(f"Removed empty closing list for match {match_id}")
+                    
+        except Exception as e:
+            logger.error(f"Error cleaning up closed worker for match {match_id}: {e}", exc_info=True)
 
     async def stop_worker(self, match_id: str):
         """
-        Stop and remove a worker for a match
+        Stop the active worker for a match and move it to closing list
+        
+        The worker will continue running in the background until it finishes cleanup.
+        New connections can create a new active worker immediately.
         
         Args:
             match_id: Match identifier
         """
-        if match_id in self.workers:
-            worker = self.workers[match_id]
-            await worker.stop()
-            del self.workers[match_id]
-            logger.info(f"Stopped and removed worker for match {match_id}")
+        # Get or create lock for this match
+        if match_id not in self.worker_locks:
+            self.worker_locks[match_id] = asyncio.Lock()
+        
+        async with self.worker_locks[match_id]:
+            if match_id not in self.active_workers:
+                logger.debug(f"No active worker for match {match_id} to stop")
+                return
+            
+            worker = self.active_workers[match_id]
+            logger.info(f"Stopping active worker for match {match_id}, moving to closing list...")
+            
+            # Move to closing list (will be cleaned up automatically)
+            self._move_to_closing(match_id, worker)
+            
+            # Trigger worker stop asynchronously (don't wait for it)
+            asyncio.create_task(worker.stop())
+            
+            logger.info(f"✅ Moved worker for match {match_id} to closing list")
 
     async def ensure_historical_worker(self, match_id: str) -> Optional[HistoricalCommentaryWorker]:
         """
@@ -194,7 +324,8 @@ class WorkerSupervisor:
 
     async def _cleanup_loop(self):
         """
-        Background task that periodically cleans up workers with no subscribers
+        Background task that periodically cleans up active workers with no subscribers
+        Closing workers clean themselves up independently
         """
         logger.info("Cleanup loop started")
         
@@ -205,26 +336,38 @@ class WorkerSupervisor:
                 if not self.is_running:
                     break
                 
-                # Check all running workers
+                # Check all active workers
                 workers_to_stop = []
                 
-                for match_id, worker in list(self.workers.items()):
+                for match_id, worker in list(self.active_workers.items()):
                     # Check subscriber count
                     subscriber_count = await self.redis_service.get_subscriber_count(match_id)
                     
                     if subscriber_count == 0:
                         logger.info(
                             f"Match {match_id} has no subscribers. "
-                            f"Marking worker for cleanup."
+                            f"Marking active worker for cleanup."
                         )
                         workers_to_stop.append(match_id)
                 
                 # Stop workers with no subscribers
                 for match_id in workers_to_stop:
-                    await self.stop_worker(match_id)
+                    # Double-check subscriber count before stopping (in case new subscribers joined)
+                    subscriber_count = await self.redis_service.get_subscriber_count(match_id)
+                    if subscriber_count == 0:
+                        await self.stop_worker(match_id)
+                    else:
+                        logger.info(f"Skipping cleanup for match {match_id} - new subscribers detected ({subscriber_count})")
                 
                 if workers_to_stop:
-                    logger.info(f"Cleaned up {len(workers_to_stop)} workers")
+                    stopped_count = len([m for m in workers_to_stop if m not in self.active_workers])
+                    logger.info(f"Cleanup cycle completed, moved {stopped_count} workers to closing list")
+                
+                # Log status for debugging
+                active_count = len(self.active_workers)
+                closing_count = sum(len(workers) for workers in self.closing_workers.values())
+                if active_count > 0 or closing_count > 0:
+                    logger.debug(f"Worker status: {active_count} active, {closing_count} closing")
                     
             except asyncio.CancelledError:
                 logger.info("Cleanup loop cancelled")
@@ -234,33 +377,54 @@ class WorkerSupervisor:
 
     def get_worker_status(self, match_id: str) -> Optional[dict]:
         """
-        Get status of a worker
+        Get status of the active worker for a match
         
         Args:
             match_id: Match identifier
         
         Returns:
-            Worker status dictionary or None if worker doesn't exist
+            Worker status dictionary or None if no active worker exists
         """
-        if match_id in self.workers:
-            return self.workers[match_id].get_status()
+        if match_id in self.active_workers:
+            status = self.active_workers[match_id].get_status()
+            status['state'] = 'active'
+            return status
         return None
 
     def get_all_workers_status(self) -> Dict[str, dict]:
         """
-        Get status of all workers
+        Get status of all workers (both active and closing)
         
         Returns:
             Dictionary mapping match_id to worker status
         """
-        return {
-            match_id: worker.get_status()
-            for match_id, worker in self.workers.items()
-        }
+        status = {}
+        
+        # Add active workers
+        for match_id, worker in self.active_workers.items():
+            worker_status = worker.get_status()
+            worker_status['state'] = 'active'
+            status[match_id] = worker_status
+        
+        # Add closing workers (with index to distinguish multiple)
+        for match_id, workers in self.closing_workers.items():
+            for idx, worker in enumerate(workers):
+                worker_status = worker.get_status()
+                worker_status['state'] = 'closing'
+                key = f"{match_id}_closing_{idx}" if idx > 0 else f"{match_id}_closing"
+                status[key] = worker_status
+        
+        return status
 
     def get_worker_count(self) -> int:
-        """Get number of running workers"""
-        return len(self.workers)
+        """Get number of active workers"""
+        return len(self.active_workers)
+    
+    def get_total_worker_count(self) -> int:
+        """Get total number of workers (active + closing)"""
+        active = len(self.active_workers)
+        closing = sum(len(workers) for workers in self.closing_workers.values())
+        return active + closing
 
     def get_historical_worker_status(self, match_id: str) -> Optional[dict]:
         if match_id in self.historical_workers:
