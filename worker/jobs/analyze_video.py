@@ -32,7 +32,7 @@ from worker.utils.s3 import (
 from database.models import VideoStatus
 from config import settings
 from services.video_analytics_service import get_video_analytics_service
-from services.bat_detector import get_bat_detector
+from services.video_processor import VideoProcessor
 # Helper function to publish video analysis messages to Redis (synchronous)
 def _publish_video_analysis_sync(video_id: str, message: dict):
     """
@@ -141,14 +141,6 @@ def analyze_video_job(video_id: str):
         # Lazily grab the shared pose estimator (already initialized at worker boot).
         pose_estimator = get_pose_estimator()
         
-        # Initialize bat detector if enabled
-        bat_detector = get_bat_detector()
-        if bat_detector and bat_detector.enabled:
-            logger.info("Bat detection enabled, will detect bats in each frame")
-        else:
-            bat_detector = None
-            logger.info("Bat detection disabled or not available")
-        
         # Step 1: Load video record from DB
         video = get_video_by_id(video_id)
         if not video:
@@ -186,20 +178,19 @@ def analyze_video_job(video_id: str):
         logger.info("Extracting video metadata")
         metadata = get_video_metadata(video_path)
 
-        # Open video for full-frame processing
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            raise RuntimeError(f"Failed to open video: {video_path}")
-
-        fps = cap.get(cv2.CAP_PROP_FPS) or (metadata.get("fps") if metadata else None)
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or (metadata.get("width") if metadata else None)
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or (metadata.get("height") if metadata else None)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if cap.get(cv2.CAP_PROP_FRAME_COUNT) > 0 else None
+        # Initialize VideoProcessor for batch processing (it will extract metadata too)
+        video_processor = VideoProcessor(video_path)
+        
+        # Get metadata from VideoProcessor
+        fps = video_processor.info.fps or (metadata.get("fps") if metadata else None)
+        width = video_processor.info.width or (metadata.get("width") if metadata else None)
+        height = video_processor.info.height or (metadata.get("height") if metadata else None)
+        total_frames = video_processor.info.total_frames or None
 
         # Update DB metadata
         update_video_metadata(
             video_id,
-            duration_seconds=metadata.get("duration_seconds") if metadata else None,
+            duration_seconds=video_processor.info.duration_seconds or (metadata.get("duration_seconds") if metadata else None),
             original_fps=fps,
             width=width,
             height=height,
@@ -212,85 +203,76 @@ def analyze_video_job(video_id: str):
 
         update_video_progress(video_id, 25)
 
-        # Step 5: Run pose model (RTMPose) and bat detection over all frames
-        logger.info("Running RTMPose and bat detection over video frames")
-        frame_index = 0
+        # Step 5: Run pose model (RTMPose) in batches
+        logger.info("Running RTMPose over video frames in batches")
+        
+        batch_size = settings.BATCH_SIZE or 16
+        
+        frames_results = []
         processed_frames = 0
         total_persons = 0
-        total_bats = 0
-        frames_results = []
 
         try:
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-
-                # Pose detection
-                pose_results = pose_estimator.infer(frame)
+            for batch in video_processor.get_batch_frames(batch_size=batch_size, sample_rate=None):
+                # Extract frame numbers and frames from batch
+                frame_nums = [fn for fn, _ in batch]
+                frames = [f for _, f in batch]
                 
-                # Bat detection (if enabled)
-                bat_detections = []
-                if bat_detector:
-                    bat_detections = bat_detector.detect(frame)
-
-                # Log basic summary similar to test_pose_inference.py
-                if pose_results:
-                    avg_conf = float(
-                        sum(r.mean_confidence for r in pose_results) / len(pose_results)
-                    )
-                    logger.info(
-                        "Frame %d -> %d persons | mean conf=%.3f | %d bats",
-                        frame_index,
-                        len(pose_results),
-                        avg_conf,
-                        len(bat_detections),
-                    )
-                else:
-                    logger.info("Frame %d -> no detections | %d bats", frame_index, len(bat_detections))
-
-                # Build per-frame JSON structure with both persons and bats
-                frame_data = {
-                    "frame_number": frame_index,
-                    "num_persons": len(pose_results),
-                    "persons": [],
-                    "num_bats": len(bat_detections),
-                    "bats": [],
-                }
+                # Batch pose detection
+                pose_results_batch = pose_estimator.infer_batch(frames, auto_detect=True)
                 
-                # Add person data
-                for i, result in enumerate(pose_results):
-                    person_data = {
-                        "person_id": i,
-                        "keypoints": result.keypoints.tolist(),
-                        "scores": result.scores.tolist(),
-                        "bbox": result.bbox,
-                        "mean_confidence": float(result.mean_confidence),
+                # Process each frame in the batch
+                for frame_num, pose_results in zip(frame_nums, pose_results_batch):
+                    # Log basic summary
+                    if pose_results:
+                        avg_conf = float(
+                            sum(r.mean_confidence for r in pose_results) / len(pose_results)
+                        )
+                        logger.info(
+                            "Frame %d -> %d persons | mean conf=%.3f",
+                            frame_num,
+                            len(pose_results),
+                            avg_conf,
+                        )
+                    else:
+                        logger.info("Frame %d -> no detections", frame_num)
+                    
+                    # Build per-frame JSON structure
+                    frame_data = {
+                        "frame_number": frame_num,
+                        "num_persons": len(pose_results),
+                        "persons": [],
+                        "num_bats": 0,  # Bat detection disabled
+                        "bats": [],
                     }
-                    frame_data["persons"].append(person_data)
+                    
+                    # Add person data
+                    for i, result in enumerate(pose_results):
+                        person_data = {
+                            "person_id": i,
+                            "keypoints": result.keypoints.tolist(),
+                            "scores": result.scores.tolist(),
+                            "bbox": result.bbox,
+                            "mean_confidence": float(result.mean_confidence),
+                        }
+                        frame_data["persons"].append(person_data)
+                    
+                    frames_results.append(frame_data)
+                    
+                    total_persons += len(pose_results)
+                    processed_frames += 1
                 
-                # Add bat data
-                for i, bat_det in enumerate(bat_detections):
-                    bat_data = {
-                        "bat_id": i,
-                        **bat_det.to_dict(),
-                    }
-                    frame_data["bats"].append(bat_data)
-
-                frames_results.append(frame_data)
-
-                total_persons += len(pose_results)
-                total_bats += len(bat_detections)
-                processed_frames += 1
-                frame_index += 1
-
-                # Rough progress update based on frames
+                # Progress update after each batch
                 if total_frames:
                     progress = 25 + int(25 * processed_frames / max(total_frames, 1))
                     update_video_progress(video_id, min(progress, 50))
+                
+                logger.info(
+                    f"Processed batch: {len(batch)} frames, total processed: {processed_frames}/{total_frames or 'unknown'}"
+                )
 
         finally:
-            cap.release()
+            video_processor.cleanup()
 
         # Assemble keypoints_data to match test_pose_inference.py:
         # a list of per-frame dicts with persons, keypoints, scores, bbox, etc.

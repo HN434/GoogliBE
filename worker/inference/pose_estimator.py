@@ -216,6 +216,38 @@ class PoseEstimator:
 
         return results
 
+    def infer_batch(
+        self,
+        frames: List[np.ndarray],
+        person_bboxes_list: Optional[List[Optional[List[List[float]]]]] = None,
+        auto_detect: bool = True,
+    ) -> List[List[PoseEstimatorResult]]:
+        """
+        Run pose inference on a batch of frames.
+        
+        Args:
+            frames: List of frames in BGR format
+            person_bboxes_list: Optional list of bbox lists (one per frame), or None for all frames
+            auto_detect: If True and bboxes not provided, auto-detect persons
+        
+        Returns:
+            List of lists of PoseEstimatorResult (one list per frame)
+        """
+        if not frames:
+            return []
+        
+        # Process each frame in the batch
+        # Note: mmpose's inference_topdown doesn't natively support batch processing,
+        # but processing in batches allows for better organization and future optimization
+        results_batch = []
+        
+        for i, frame_bgr in enumerate(frames):
+            bboxes = person_bboxes_list[i] if person_bboxes_list and i < len(person_bboxes_list) else None
+            frame_results = self.infer(frame_bgr, person_bboxes=bboxes, auto_detect=auto_detect)
+            results_batch.append(frame_results)
+        
+        return results_batch
+
 
 @lru_cache(maxsize=1)
 def get_pose_estimator() -> PoseEstimator:
