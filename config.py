@@ -93,7 +93,7 @@ class Settings(BaseSettings):
     CORS_ALLOW_ORIGINS: List[str] = ["*"]  # Allow all origins. Can be overridden via CORS_ALLOW_ORIGINS env var (comma-separated)
 
     # ===== Shot Classification =====
-    SHOT_CLASSIFICATION_ENABLED: bool = True
+    SHOT_CLASSIFICATION_ENABLED: bool = False
     SHORT_PITCH_DETECTION_ENABLED: bool = True
     MIN_SHOT_CONFIDENCE: float = 0.6
 
