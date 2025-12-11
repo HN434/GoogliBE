@@ -22,3 +22,15 @@ yolov8n-pose.pt
 __googli__/
 
 rtmpose-s/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.h5
+*.tflite
+runs/
+weights/
+checkpoints/
+models/
+
+*.pem
