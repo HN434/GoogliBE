@@ -90,12 +90,7 @@ class Settings(BaseSettings):
     ENABLE_JOB_QUEUE: bool = True
     
     # ===== CORS Settings =====
-    CORS_ALLOW_ORIGINS: List[str] = [
-        "http://localhost:5173",
-        "http://localhost:3000",
-        "http://127.0.0.1:5173",
-        "http://127.0.0.1:3000",
-    ]  # Can be overridden via CORS_ALLOW_ORIGINS env var (comma-separated)
+    CORS_ALLOW_ORIGINS: List[str] = ["*"]  # Allow all origins. Can be overridden via CORS_ALLOW_ORIGINS env var (comma-separated)
 
     # ===== Shot Classification =====
     SHOT_CLASSIFICATION_ENABLED: bool = True

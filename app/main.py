@@ -53,11 +53,27 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# CORS configuration for React frontend
+# CORS configuration - allow all origins by default
+cors_origins = settings.CORS_ALLOW_ORIGINS
+# Handle environment variable override (comma-separated string) if needed
+if os.getenv("CORS_ALLOW_ORIGINS"):
+    env_origins = os.getenv("CORS_ALLOW_ORIGINS").strip()
+    if env_origins:
+        cors_origins = [origin.strip() for origin in env_origins.split(",") if origin.strip()]
+
+# If "*" is in the list, allow all origins (must set allow_credentials=False)
+# Note: FastAPI doesn't allow allow_credentials=True with allow_origins=["*"]
+allow_all = "*" in cors_origins or cors_origins == ["*"]
+if allow_all:
+    cors_origins = ["*"]
+    allow_credentials = False
+else:
+    allow_credentials = True
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
-    allow_credentials=True,
+    allow_origins=cors_origins,
+    allow_credentials=allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
