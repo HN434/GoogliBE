@@ -43,18 +43,48 @@ async def main():
     
     # Parse Redis URL or use defaults
     redis_url = settings.REDIS_URL or "redis://localhost:6379/0"
+    password = None
     
-    # Extract host, port, db from URL
+    # Extract host, port, db, and password from URL
     if redis_url.startswith("redis://"):
-        parts = redis_url.replace("redis://", "").split("/")
-        host_port = parts[0].split(":")
-        host = host_port[0] if len(host_port) > 0 else "localhost"
-        port = int(host_port[1]) if len(host_port) > 1 else 6379
-        db = int(parts[1]) if len(parts) > 1 else 0
+        # Handle URL with password: redis://:password@host:port/db
+        url_without_protocol = redis_url.replace("redis://", "")
+        
+        # Check if password is in URL
+        if "@" in url_without_protocol:
+            # Format: :password@host:port/db or username:password@host:port/db
+            auth_and_rest = url_without_protocol.split("@")
+            auth_part = auth_and_rest[0]
+            rest = auth_and_rest[1]
+            
+            # Extract password (format: :password or username:password)
+            if ":" in auth_part:
+                password = auth_part.split(":")[-1] if auth_part.startswith(":") else auth_part.split(":")[1]
+            
+            # Parse host, port, db from rest
+            parts = rest.split("/")
+            host_port = parts[0].split(":")
+            host = host_port[0] if len(host_port) > 0 else "localhost"
+            port = int(host_port[1]) if len(host_port) > 1 else 6379
+            db = int(parts[1]) if len(parts) > 1 else 0
+        else:
+            # No password in URL, parse normally
+            parts = url_without_protocol.split("/")
+            host_port = parts[0].split(":")
+            host = host_port[0] if len(host_port) > 0 else "localhost"
+            port = int(host_port[1]) if len(host_port) > 1 else 6379
+            db = int(parts[1]) if len(parts) > 1 else 0
+            
+            # Use password from settings if not in URL (for server environments)
+            if settings.REDIS_PASSWORD:
+                password = settings.REDIS_PASSWORD
     else:
         host = "localhost"
         port = 6379
         db = 0
+        # Use password from settings if provided (for server environments)
+        if settings.REDIS_PASSWORD:
+            password = settings.REDIS_PASSWORD
     
     logger.info(f"Connecting to Redis at {host}:{port}/{db}")
 
@@ -65,6 +95,9 @@ async def main():
             port=port,
             database=db,
         )
+        # Add password if available
+        if password:
+            redis_settings.password = password
         redis = await create_pool(redis_settings)
         logger.info("✅ Redis connection pool established for ARQ")
 

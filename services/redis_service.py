@@ -32,6 +32,20 @@ class RedisService:
         # then to a sane local default. This ensures all components (API server,
         # workers) use the same Redis instance when REDIS_URL is configured.
         effective_url = redis_url or settings.REDIS_URL or "redis://localhost:6379/0"
+        
+        # Conditionally add password to URL if provided (for server environments)
+        # Format: redis://:password@host:port/db
+        # Only add password if URL doesn't already contain one (no @ symbol)
+        if settings.REDIS_PASSWORD and "@" not in effective_url:
+            # Parse the URL and inject password
+            if effective_url.startswith("redis://"):
+                # Extract parts: redis://host:port/db
+                url_parts = effective_url.replace("redis://", "").split("/")
+                host_port = url_parts[0]
+                db = url_parts[1] if len(url_parts) > 1 else "0"
+                # Build URL with password: redis://:password@host:port/db
+                effective_url = f"redis://:{settings.REDIS_PASSWORD}@{host_port}/{db}"
+        
         self.redis_url = effective_url
         self.redis_client: Optional[aioredis.Redis] = None
         self.pubsub_client: Optional[aioredis.Redis] = None

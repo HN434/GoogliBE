@@ -135,6 +135,7 @@ class Settings(BaseSettings):
 
     # ===== Commentary System =====
     REDIS_URL: str = os.getenv("REDIS_URL")
+    REDIS_PASSWORD: Optional[str] = os.getenv("REDIS_PASSWORD")  # Optional password for server environments
     RAPIDAPI_KEY: Optional[str] = None  # Legacy: single key (for backward compatibility)
     RAPIDAPI_KEYS: Optional[str] = None  # Comma-separated list of API keys (e.g., "key1,key2,key3")
     RAPIDAPI_HOST: str = "cricbuzz-cricket.p.rapidapi.com"
