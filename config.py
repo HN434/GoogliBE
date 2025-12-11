@@ -46,7 +46,7 @@ class Settings(BaseSettings):
         "RTMPOSE_CHECKPOINT_PATH",
         "models/rtmpose-s/rtmpose-s_simcc-coco_pt-aic-coco_420e-256x192-8edcf0d7_20230127.pth",
     )
-    RTMPOSE_DEVICE: str = os.getenv("RTMPOSE_DEVICE", "cpu")
+    RTMPOSE_DEVICE: str = os.getenv("RTMPOSE_DEVICE", "cuda")
 
     # ===== RF-DETR Bat Detection =====
     BAT_DETECTION_ENABLED: bool = os.getenv("BAT_DETECTION_ENABLED", "true").lower() == "true"

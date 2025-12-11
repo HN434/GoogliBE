@@ -73,7 +73,7 @@ class PoseEstimator:
         self,
         config_path: Path,
         checkpoint_path: Path,
-        device: str = "cpu",
+        device: str = "cuda",
     ):
         if not config_path.exists():
             raise FileNotFoundError(f"RTMPose config not found: {config_path}")
@@ -226,7 +226,7 @@ def get_pose_estimator() -> PoseEstimator:
     """
     config_path = Path(settings.RTMPOSE_CONFIG_PATH).expanduser().resolve()
     checkpoint_path = Path(settings.RTMPOSE_CHECKPOINT_PATH).expanduser().resolve()
-    device = settings.RTMPOSE_DEVICE or "cpu"
+    device = settings.RTMPOSE_DEVICE or "cuda"
 
     estimator = PoseEstimator(
         config_path=config_path,
