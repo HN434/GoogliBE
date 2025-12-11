@@ -389,30 +389,9 @@ def analyze_video_job(video_id: str):
         
         # Step 8: Compute and store high-level pose metrics for Bedrock / UI
         from services.video_pose_metrics import compute_video_pose_metrics
-        from services.shot_classifier import get_shot_classifier
-
         logger.info("Computing aggregated pose metrics for video %s", video_id)
         metrics = compute_video_pose_metrics(keypoints_data=keypoints_data, video_id=video_id)
 
-        # Classify shot type from aggregated metrics
-        shot_classification = None
-        try:
-            logger.info("Classifying shot type for video %s", video_id)
-            shot_classifier = get_shot_classifier()
-            shot_classification = shot_classifier.classify_shot_from_metrics(metrics)
-            logger.info(
-                "Shot classification for video %s: %s (confidence: %.2f)",
-                video_id,
-                shot_classification.get("primary_shot", "unknown"),
-                shot_classification.get("confidence", 0.0),
-            )
-        except Exception as e:
-            logger.error(
-                "Failed to classify shot type for video %s: %s",
-                video_id,
-                e,
-                exc_info=True,
-            )
 
         # Optionally, generate Bedrock analytics immediately after metrics are ready.
         # This allows the frontend to fetch a pre-computed analytics JSON instead of
@@ -438,8 +417,6 @@ def analyze_video_job(video_id: str):
         # If analytics were generated, embed them under 'bedrock_analytics' so both
         # raw metrics and AI commentary are available from a single JSON blob.
         metrics_payload = dict(metrics)
-        if shot_classification is not None:
-            metrics_payload["shot_classification"] = shot_classification
         if analytics is not None:
             metrics_payload["bedrock_analytics"] = analytics
 

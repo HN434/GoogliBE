@@ -79,31 +79,6 @@ class EventClassifier:
             if player_id in self.player_cooldowns:
                 continue
 
-            # Check for shot events
-            if settings.SHOT_CLASSIFICATION_ENABLED:
-                shot_type, confidence = self._classify_shot(detection.metrics)
-
-                if shot_type and confidence >= settings.MIN_SHOT_CONFIDENCE:
-                    # Start or update event
-                    if player_id not in self.active_events:
-                        self.active_events[player_id] = EventCandidate(
-                            event_type="shot",
-                            shot_type=shot_type,
-                            player_id=player_id,
-                            start_frame=frame_num,
-                            keyframe=frame_num,
-                            confidences=[confidence],
-                            metrics_history=[detection.metrics]
-                        )
-                    else:
-                        event = self.active_events[player_id]
-                        event.confidences.append(confidence)
-                        event.metrics_history.append(detection.metrics)
-
-                        # Update keyframe if higher confidence
-                        if confidence > max(event.confidences[:-1], default=0):
-                            event.keyframe = frame_num
-
             # Check for short-pitch events
             if settings.SHORT_PITCH_DETECTION_ENABLED:
                 is_short_pitch, confidence = self._detect_short_pitch(detection.metrics)

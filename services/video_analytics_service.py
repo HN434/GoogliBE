@@ -83,29 +83,7 @@ class VideoAnalyticsService:
         metrics_json = json.dumps(metrics, ensure_ascii=False)
         
         # Build interpretive context for metrics
-        context = self._build_interpretive_context(metrics)
-        
-        # Extract shot classification if available
-        shot_info = ""
-        if "shot_classification" in metrics:
-            shot_class = metrics["shot_classification"]
-            primary_shot = shot_class.get("primary_shot")
-            confidence = shot_class.get("confidence", 0.0)
-            alternatives = shot_class.get("alternative_shots", [])
-            
-            if primary_shot:
-                alt_text = ""
-                if alternatives:
-                    alt_shots = ', '.join([a.get('shot_type', '') for a in alternatives[:2]])
-                    if alt_shots:
-                        alt_text = f" Alternative possibilities: {alt_shots}."
-                
-                shot_info = (
-                    f"\n\n=== SHOT TYPE ANALYSIS ===\n"
-                    f"Primary shot detected: {primary_shot.replace('_', ' ').title()} "
-                    f"(confidence: {confidence:.1%}){alt_text}\n"
-                    f"Tailor your coaching advice specifically for this shot type.\n"
-                )
+        context = self._build_interpretive_context(metrics)       
         
         return (
             "You are an expert Level 3 cricket batting coach with 20+ years of experience "
@@ -121,8 +99,6 @@ class VideoAnalyticsService:
             "Analyze the following cricket batting video metrics and provide coaching feedback in plain, everyday language. "
             "Use the data to inform your advice, but explain it without technical jargon, degrees, or angles unless absolutely necessary. "
             "Focus on what the player should feel and do rather than quoting numbers.\n"
-            
-            + shot_info +
             
             "\n=== AVAILABLE METRICS ===\n"
             + context +
