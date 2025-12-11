@@ -94,7 +94,7 @@ class Settings(BaseSettings):
 
     # ===== Shot Classification =====
     SHOT_CLASSIFICATION_ENABLED: bool = False
-    SHORT_PITCH_DETECTION_ENABLED: bool = FALSE
+    SHORT_PITCH_DETECTION_ENABLED: bool = False
     MIN_SHOT_CONFIDENCE: float = 0.6
 
     # ===== Metrics Computation =====
