@@ -13,7 +13,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from worker.inference import get_pose_estimator
+from worker.inference import get_pose_estimator, PoseEstimatorResult
 from worker.utils.db import (
     get_video_by_id,
     update_video_status,
@@ -32,7 +32,8 @@ from worker.utils.s3 import (
 from database.models import VideoStatus
 from config import settings
 from services.video_analytics_service import get_video_analytics_service
-from services.video_processor import VideoProcessor
+from services.video_processor import VideoProcessor, VideoWriter
+from typing import List, Dict, Any
 # Helper function to publish video analysis messages to Redis (synchronous)
 def _publish_video_analysis_sync(video_id: str, message: dict):
     """
@@ -112,6 +113,283 @@ def _publish_video_analysis_sync(video_id: str, message: dict):
         # Don't raise - allow job to continue even if Redis publish fails
 
 logger = logging.getLogger(__name__)
+
+
+def _convert_keypoints_data_to_results(frame_data: Dict[str, Any]) -> List[PoseEstimatorResult]:
+    """
+    Convert keypoints data from JSON format to PoseEstimatorResult format.
+    
+    Args:
+        frame_data: Frame data dictionary with 'persons' list
+        
+    Returns:
+        List of PoseEstimatorResult objects
+    """
+    results = []
+    
+    for person_data in frame_data.get("persons", []):
+        keypoints = np.array(person_data.get("keypoints", []), dtype=np.float32)
+        scores = np.array(person_data.get("scores", []), dtype=np.float32)
+        bbox = person_data.get("bbox", [0, 0, 0, 0])
+        
+        if len(keypoints) > 0 and len(scores) > 0:
+            results.append(
+                PoseEstimatorResult(
+                    keypoints=keypoints,
+                    scores=scores,
+                    bbox=bbox,
+                )
+            )
+    
+    return results
+
+
+def _draw_skeletons_on_frame(
+    frame: np.ndarray,
+    results: List[PoseEstimatorResult]
+) -> np.ndarray:
+    """
+    Draw skeletons for all detected persons on a frame.
+    Each person gets a different color scheme for visibility.
+    
+    Args:
+        frame: Input frame (BGR format)
+        results: List of PoseEstimatorResult for each detected person
+        
+    Returns:
+        Annotated frame with skeletons drawn
+    """
+    # COCO 17 keypoint connections (skeleton) with color assignments
+    skeleton_connections = [
+        # Left arm (5: left shoulder, 7: left elbow, 9: left wrist)
+        ([5, 7], 'left_arm'), ([7, 9], 'left_arm'),
+        # Right arm (6: right shoulder, 8: right elbow, 10: right wrist)
+        ([6, 8], 'right_arm'), ([8, 10], 'right_arm'),
+        # Torso (shoulders and hips)
+        ([5, 6], 'torso'),  # Shoulders
+        ([11, 12], 'torso'),  # Hips
+        ([5, 11], 'torso'),  # Left shoulder to left hip
+        ([6, 12], 'torso'),  # Right shoulder to right hip
+        # Left leg (11: left hip, 13: left knee, 15: left ankle)
+        ([11, 13], 'left_leg'), ([13, 15], 'left_leg'),
+        # Right leg (12: right hip, 14: right knee, 16: right ankle)
+        ([12, 14], 'right_leg'), ([14, 16], 'right_leg'),
+    ]
+    
+    vis_frame = frame.copy()
+    
+    # Define different color schemes for each person
+    person_color_schemes = [
+        # Person 1: Original colors
+        {
+            'head': (255, 255, 0),      # Cyan
+            'left_arm': (0, 0, 255),    # Red
+            'right_arm': (0, 165, 255), # Orange
+            'torso': (0, 255, 0),       # Green
+            'left_leg': (255, 0, 255),  # Magenta
+            'right_leg': (128, 0, 128), # Purple
+        },
+        # Person 2: Brighter variants
+        {
+            'head': (255, 255, 100),    # Light Cyan
+            'left_arm': (100, 100, 255), # Light Red
+            'right_arm': (100, 200, 255), # Light Orange
+            'torso': (100, 255, 100),   # Light Green
+            'left_leg': (255, 100, 255), # Light Magenta
+            'right_leg': (200, 100, 200), # Light Purple
+        },
+        # Person 3: Darker variants
+        {
+            'head': (200, 200, 0),      # Dark Cyan
+            'left_arm': (0, 0, 200),    # Dark Red
+            'right_arm': (0, 120, 200), # Dark Orange
+            'torso': (0, 200, 0),       # Dark Green
+            'left_leg': (200, 0, 200),  # Dark Magenta
+            'right_leg': (100, 0, 100), # Dark Purple
+        },
+        # Person 4+: Cycle through variants
+        {
+            'head': (150, 255, 150),    # Greenish Cyan
+            'left_arm': (200, 150, 0),  # Orange Red
+            'right_arm': (0, 200, 255), # Cyan Orange
+            'torso': (150, 150, 255),   # Blue Green
+            'left_leg': (255, 150, 0), # Yellow Magenta
+            'right_leg': (150, 0, 255), # Blue Purple
+        },
+    ]
+    
+    for person_idx, result in enumerate(results):
+        # Get color scheme for this person (cycle if more than 4 persons)
+        color_scheme = person_color_schemes[person_idx % len(person_color_schemes)]
+        keypoints = result.keypoints  # Shape: (17, 2) or (17, 3)
+        scores = result.scores  # Shape: (17,)
+        
+        # Extract x, y coordinates (ignore z if present)
+        if keypoints.shape[1] >= 2:
+            kpts_2d = keypoints[:, :2]
+        else:
+            continue
+        
+        # Calculate bounding box size for scaling visualization elements
+        bbox_size = 200.0  # Default reference size
+        if result.bbox and len(result.bbox) >= 4:
+            bbox_width = result.bbox[2] - result.bbox[0]
+            bbox_height = result.bbox[3] - result.bbox[1]
+            bbox_avg_dim = (bbox_width + bbox_height) / 2.0
+            bbox_size = max(bbox_avg_dim, 50.0)  # Minimum 50px
+        
+        # Scale visualization elements based on bbox size
+        scale_factor = min(bbox_size / 200.0, 1.0)  # Cap at 1.0
+        line_thickness = max(int(4 * scale_factor), 2)  # Minimum 2px
+        outer_radius = max(int(10 * scale_factor), 4)  # Minimum 4px
+        inner_radius = max(int(8 * scale_factor), 3)  # Minimum 3px
+        
+        # Draw head to shoulder center connection (special case)
+        if len(kpts_2d) > 6:
+            left_shoulder = kpts_2d[5]  # Left shoulder
+            right_shoulder = kpts_2d[6]  # Right shoulder
+            shoulder_center = ((left_shoulder[0] + right_shoulder[0]) / 2, 
+                             (left_shoulder[1] + right_shoulder[1]) / 2)
+            nose = kpts_2d[0]  # Nose
+            
+            score_nose = scores[0] if 0 < len(scores) else 0.0
+            score_left_shoulder = scores[5] if 5 < len(scores) else 0.0
+            score_right_shoulder = scores[6] if 6 < len(scores) else 0.0
+            
+            # Draw if nose and at least one shoulder has reasonable confidence
+            if score_nose > 0.3 and (score_left_shoulder > 0.3 or score_right_shoulder > 0.3):
+                nose_pt = tuple(nose.astype(int))
+                center_pt = tuple(int(c) for c in shoulder_center)
+                head_color = color_scheme['head']
+                cv2.line(vis_frame, nose_pt, center_pt, head_color, line_thickness)
+        
+        # Draw skeleton connections with color coding
+        for connection, color_name in skeleton_connections:
+            idx1, idx2 = connection[0], connection[1]
+            if 0 <= idx1 < len(kpts_2d) and 0 <= idx2 < len(kpts_2d):
+                pt1 = tuple(kpts_2d[idx1].astype(int))
+                pt2 = tuple(kpts_2d[idx2].astype(int))
+                score1 = scores[idx1] if idx1 < len(scores) else 0.5
+                score2 = scores[idx2] if idx2 < len(scores) else 0.5
+                
+                # Only draw if both keypoints have reasonable confidence
+                if score1 > 0.3 and score2 > 0.3:
+                    color = color_scheme.get(color_name, (255, 255, 255))
+                    cv2.line(vis_frame, pt1, pt2, color, line_thickness)
+        
+        # Draw keypoints - skip eye and ear keypoints
+        head_keypoints_to_skip = [1, 2, 3, 4]  # Eyes and ears
+        
+        for i, (x, y) in enumerate(kpts_2d):
+            if i in head_keypoints_to_skip:
+                continue
+            
+            score = scores[i] if i < len(scores) else 0.0
+            if score > 0.3:  # Only draw visible keypoints
+                pt = (int(x), int(y))
+                # Map keypoint index to body part
+                if i == 0:  # Nose (head)
+                    base_color = color_scheme['head']
+                elif i in [5, 7, 9]:  # Left arm
+                    base_color = color_scheme['left_arm']
+                elif i in [6, 8, 10]:  # Right arm
+                    base_color = color_scheme['right_arm']
+                elif i in [11, 12]:  # Hips (torso)
+                    base_color = color_scheme['torso']
+                elif i in [13, 15]:  # Left leg
+                    base_color = color_scheme['left_leg']
+                elif i in [14, 16]:  # Right leg
+                    base_color = color_scheme['right_leg']
+                else:
+                    base_color = (255, 255, 255)  # Default white
+                
+                # Darken color based on confidence
+                if score > 0.7:
+                    color = base_color
+                else:
+                    color = tuple(int(c * 0.7) for c in base_color)
+                
+                # Draw circles: outer circle (dark border), inner circle (filled)
+                cv2.circle(vis_frame, pt, outer_radius, (0, 0, 0), -1)  # Black outer
+                cv2.circle(vis_frame, pt, inner_radius, color, -1)  # Colored inner
+    
+    return vis_frame
+
+
+def _generate_overlay_video(
+    video_path: str,
+    keypoints_data: List[Dict[str, Any]],
+    output_path: str,
+    progress_callback: Optional[callable] = None
+) -> None:
+    """
+    Generate overlay video with skeletons drawn for all detected persons.
+    
+    Args:
+        video_path: Path to input video
+        keypoints_data: List of frame data dictionaries with keypoints
+        output_path: Path to output overlay video
+        progress_callback: Optional callback function(progress_percent) for progress updates
+    """
+    logger.info(f"Generating overlay video: {video_path} -> {output_path}")
+    
+    # Create a dictionary mapping frame numbers to keypoints data for quick lookup
+    frame_data_map = {frame_data["frame_number"]: frame_data for frame_data in keypoints_data}
+    
+    # Open input video
+    video_processor = VideoProcessor(video_path)
+    width = video_processor.info.width
+    height = video_processor.info.height
+    fps = video_processor.info.fps
+    total_frames = video_processor.info.total_frames
+    
+    logger.info(f"Video info: {width}x{height} @ {fps} fps, {total_frames} frames")
+    
+    # Create output video writer
+    video_writer = VideoWriter(output_path, width, height, fps)
+    
+    try:
+        frame_count = 0
+        
+        # Process all frames from the video
+        for frame_num, frame in video_processor.frame_generator(sample_rate=1):
+            # Look up keypoints data for this frame
+            frame_data = frame_data_map.get(frame_num)
+            
+            if frame_data and frame_data.get("num_persons", 0) > 0:
+                # Convert keypoints data to PoseEstimatorResult format
+                pose_results = _convert_keypoints_data_to_results(frame_data)
+                num_persons = len(pose_results)
+                
+                # Draw skeletons for all detected persons
+                annotated_frame = _draw_skeletons_on_frame(frame, pose_results)
+                
+                if num_persons > 1:
+                    logger.debug(
+                        f"Frame {frame_num}: Drew skeletons for {num_persons} persons (multi-person detection)"
+                    )
+                else:
+                    logger.debug(
+                        f"Frame {frame_num}: Drew skeleton for {num_persons} person"
+                    )
+            else:
+                # No detections for this frame, use original frame
+                annotated_frame = frame
+            
+            # Write annotated frame to output video
+            video_writer.write_frame(annotated_frame)
+            frame_count += 1
+            
+            # Progress callback
+            if progress_callback and total_frames > 0:
+                progress = int(100 * frame_count / total_frames)
+                progress_callback(progress)
+        
+        logger.info(f"Successfully generated overlay video: {output_path} ({frame_count} frames)")
+        
+    finally:
+        video_writer.cleanup()
+        video_processor.cleanup()
 
 
 def analyze_video_job(video_id: str):
@@ -228,12 +506,21 @@ def analyze_video_job(video_id: str):
                         avg_conf = float(
                             sum(r.mean_confidence for r in pose_results) / len(pose_results)
                         )
-                        logger.info(
-                            "Frame %d -> %d persons | mean conf=%.3f",
-                            frame_num,
-                            len(pose_results),
-                            avg_conf,
-                        )
+                        num_persons = len(pose_results)
+                        if num_persons > 1:
+                            logger.info(
+                                "Frame %d -> %d persons detected (multi-person) | mean conf=%.3f",
+                                frame_num,
+                                num_persons,
+                                avg_conf,
+                            )
+                        else:
+                            logger.info(
+                                "Frame %d -> %d person | mean conf=%.3f",
+                                frame_num,
+                                num_persons,
+                                avg_conf,
+                            )
                     else:
                         logger.info("Frame %d -> no detections", frame_num)
                     
@@ -349,23 +636,48 @@ def analyze_video_job(video_id: str):
         update_video_progress(video_id, 70)
         
         # Step 7: Generate overlay MP4 and upload it
-        # TODO: Implement video overlay generation
-        logger.info("Generating overlay video (placeholder)")
-        # This is where you would:
-        # - Create overlay video with skeleton/keypoints drawn
-        # - Render using OpenCV or similar
-        # - Save as MP4
+        logger.info("Generating overlay video with skeletons for all detected persons")
         
-        # Placeholder: For now, we'll skip overlay generation
-        # Uncomment and implement when ready:
-        # overlay_video_path = os.path.join(temp_dir, f"{video_id}_overlay.mp4")
-        # generate_overlay_video(video_path, keypoints_data, overlay_video_path)
-        # overlay_s3_key = f"overlays/{video_id}/overlay.mp4"
-        # upload_to_s3(overlay_video_path, overlay_s3_key, "video/mp4")
-        # update_video_outputs(video_id, overlay_video_s3_key=overlay_s3_key)
+        # Create overlay video path
+        if storage_type == 'local':
+            overlay_video_path = str(Path(video.local_file_path).parent / f"{video_id}_overlay.mp4")
+        else:
+            overlay_video_path = os.path.join(temp_dir, f"{video_id}_overlay.mp4")
         
-        # For now, set overlay_s3_key to None
-        overlay_s3_key = None
+        # Generate overlay video with progress updates
+        def overlay_progress_callback(progress_percent: int):
+            # Map overlay progress (0-100) to overall progress (70-85)
+            overall_progress = 70 + int(15 * progress_percent / 100)
+            update_video_progress(video_id, min(overall_progress, 85))
+        
+        try:
+            _generate_overlay_video(
+                video_path=video_path,
+                keypoints_data=keypoints_data,
+                output_path=overlay_video_path,
+                progress_callback=overlay_progress_callback
+            )
+            
+            # Upload or store overlay video
+            if storage_type == 'local':
+                # Store locally
+                update_video_outputs(
+                    video_id,
+                    overlay_video_local_path=overlay_video_path,
+                )
+                overlay_s3_key = None
+            else:
+                # Upload to S3
+                overlay_s3_key = f"overlays/{video_id}/overlay.mp4"
+                upload_to_s3(overlay_video_path, overlay_s3_key, "video/mp4")
+                update_video_outputs(video_id, overlay_video_s3_key=overlay_s3_key)
+            
+            logger.info(f"Successfully generated and stored overlay video for {video_id}")
+            
+        except Exception as e:
+            logger.error(f"Failed to generate overlay video: {e}", exc_info=True)
+            # Continue processing even if overlay generation fails
+            overlay_s3_key = None
         
         update_video_progress(video_id, 85)
         
