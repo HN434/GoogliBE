@@ -258,7 +258,7 @@ def get_pose_estimator() -> PoseEstimator:
     """
     config_path = Path(settings.RTMPOSE_CONFIG_PATH).expanduser().resolve()
     checkpoint_path = Path(settings.RTMPOSE_CHECKPOINT_PATH).expanduser().resolve()
-    device = settings.RTMPOSE_DEVICE or "cuda"
+    device = settings.DEVICE
 
     estimator = PoseEstimator(
         config_path=config_path,

@@ -26,7 +26,7 @@ class Settings(BaseSettings):
 
     # ===== GPU & Performance =====
     USE_GPU: bool = True
-    DEVICE: str = "cuda"  # cuda, cpu, or mps (for Mac M1/M2)
+    DEVICE: str = os.getenv("DEVICE") # cuda, cpu, or mps (for Mac M1/M2)
     BATCH_SIZE: int = 16
     NUM_WORKERS: int = 4
 
@@ -147,6 +147,8 @@ class Settings(BaseSettings):
     BEDROCK_TEMPERATURE: float = 0.2
     BEDROCK_TOP_P: float = 0.9
     BEDROCK_MAX_TOKENS: int = 3072  # Increased for more detailed analysis
+    # Pegasus model ID for video analysis via Bedrock (e.g., "us.twelvelabs.pegasus-1.2-v1:0")
+    BEDROCK_PEGASUS_MODEL_ID: Optional[str] = os.getenv("BEDROCK_PEGASUS_MODEL_ID")
     
     # ===== Googli AI Chat Settings =====
     SERPER_API_KEY: Optional[str] = os.getenv("SERPER_API_KEY")

@@ -6,7 +6,7 @@ Handles presigned URL generation and S3 operations
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from typing import Optional, Dict
+from typing import Optional, Dict, List, Any
 import logging
 from datetime import datetime, timedelta
 from config import settings
@@ -98,11 +98,6 @@ class S3Service:
                 'Key': s3_key,
                 'ContentType': content_type,
             }
-
-            # Add content length restriction if specified
-            if max_size_mb:
-                max_bytes = max_size_mb * 1024 * 1024
-                params['ContentLengthRange'] = (0, max_bytes)
 
             # Generate presigned URL
             presigned_url = self.s3_client.generate_presigned_url(
@@ -207,6 +202,152 @@ class S3Service:
         except ClientError as e:
             logger.error(f"Failed to generate presigned download URL: {e}")
             raise RuntimeError(f"Failed to generate presigned download URL: {str(e)}")
+    
+    def initiate_multipart_upload(
+        self,
+        s3_key: str,
+        content_type: str
+    ) -> Dict[str, str]:
+        """
+        Initiate a multipart upload to S3
+        
+        Args:
+            s3_key: S3 key where the file will be stored
+            content_type: MIME type of the file
+            
+        Returns:
+            Dictionary with upload_id and other metadata
+        """
+        if not self.s3_client or not self.bucket_name:
+            raise RuntimeError("S3 client not initialized or bucket not configured.")
+        
+        try:
+            response = self.s3_client.create_multipart_upload(
+                Bucket=self.bucket_name,
+                Key=s3_key,
+                ContentType=content_type
+            )
+            
+            upload_id = response['UploadId']
+            logger.info(f"Initiated multipart upload for {s3_key}, upload_id: {upload_id}")
+            
+            return {
+                "upload_id": upload_id,
+                "s3_key": s3_key,
+                "s3_bucket": self.bucket_name
+            }
+        except ClientError as e:
+            logger.error(f"Failed to initiate multipart upload: {e}")
+            raise RuntimeError(f"Failed to initiate multipart upload: {str(e)}")
+    
+    def generate_presigned_url_for_part(
+        self,
+        s3_key: str,
+        upload_id: str,
+        part_number: int,
+        expiration: int = 3600
+    ) -> Dict[str, str]:
+        """
+        Generate a presigned URL for uploading a single part in multipart upload
+        
+        Args:
+            s3_key: S3 key where the file will be stored
+            upload_id: Multipart upload ID from initiate_multipart_upload
+            part_number: Part number (1-indexed)
+            expiration: URL expiration time in seconds
+            
+        Returns:
+            Dictionary with presigned URL and part number
+        """
+        if not self.s3_client or not self.bucket_name:
+            raise RuntimeError("S3 client not initialized or bucket not configured.")
+        
+        try:
+            presigned_url = self.s3_client.generate_presigned_url(
+                'upload_part',
+                Params={
+                    'Bucket': self.bucket_name,
+                    'Key': s3_key,
+                    'UploadId': upload_id,
+                    'PartNumber': part_number
+                },
+                ExpiresIn=expiration
+            )
+            
+            return {
+                "upload_url": presigned_url,
+                "part_number": part_number,
+                "upload_id": upload_id
+            }
+        except ClientError as e:
+            logger.error(f"Failed to generate presigned URL for part {part_number}: {e}")
+            raise RuntimeError(f"Failed to generate presigned URL for part: {str(e)}")
+    
+    def complete_multipart_upload(
+        self,
+        s3_key: str,
+        upload_id: str,
+        parts: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """
+        Complete a multipart upload
+        
+        Args:
+            s3_key: S3 key where the file is being uploaded
+            upload_id: Multipart upload ID
+            parts: List of part dictionaries with 'PartNumber' and 'ETag'
+            
+        Returns:
+            Dictionary with completion information
+        """
+        if not self.s3_client or not self.bucket_name:
+            raise RuntimeError("S3 client not initialized or bucket not configured.")
+        
+        try:
+            response = self.s3_client.complete_multipart_upload(
+                Bucket=self.bucket_name,
+                Key=s3_key,
+                UploadId=upload_id,
+                MultipartUpload={'Parts': parts}
+            )
+            
+            logger.info(f"Completed multipart upload for {s3_key}")
+            
+            return {
+                "location": response.get('Location'),
+                "bucket": response.get('Bucket'),
+                "key": response.get('Key'),
+                "etag": response.get('ETag')
+            }
+        except ClientError as e:
+            logger.error(f"Failed to complete multipart upload: {e}")
+            raise RuntimeError(f"Failed to complete multipart upload: {str(e)}")
+    
+    def abort_multipart_upload(
+        self,
+        s3_key: str,
+        upload_id: str
+    ) -> None:
+        """
+        Abort a multipart upload
+        
+        Args:
+            s3_key: S3 key where the file was being uploaded
+            upload_id: Multipart upload ID
+        """
+        if not self.s3_client or not self.bucket_name:
+            raise RuntimeError("S3 client not initialized or bucket not configured.")
+        
+        try:
+            self.s3_client.abort_multipart_upload(
+                Bucket=self.bucket_name,
+                Key=s3_key,
+                UploadId=upload_id
+            )
+            logger.info(f"Aborted multipart upload for {s3_key}")
+        except ClientError as e:
+            logger.error(f"Failed to abort multipart upload: {e}")
+            raise RuntimeError(f"Failed to abort multipart upload: {str(e)}")
 
 
 # Global S3 service instance

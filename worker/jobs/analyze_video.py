@@ -481,7 +481,64 @@ def analyze_video_job(video_id: str):
 
         update_video_progress(video_id, 25)
 
-        # Step 5: Run pose model (RTMPose) in batches
+        # Step 5: Generate Pegasus analysis from S3 URL via Bedrock (before keypoints extraction)
+        pegasus_analytics = None
+        if settings.BEDROCK_REGION and (settings.BEDROCK_PEGASUS_MODEL_ID or settings.BEDROCK_MODEL_ID):
+            try:
+                logger.info("Generating Pegasus analysis for video %s via Bedrock", video_id)
+                from services.video_analytics_service import get_pegasus_service
+                from services.s3_service import s3_service
+                
+                pegasus_service = get_pegasus_service()
+                
+                # Generate S3 URI for Pegasus (Pegasus uses S3 URIs, not presigned URLs)
+                if storage_type == 's3' and video.s3_raw_key and video.s3_bucket:
+                    s3_uri = f"s3://{video.s3_bucket}/{video.s3_raw_key}"
+                elif storage_type == 'local' and video.local_file_path:
+                    # For local storage, we'd need to upload to S3 first or use a different approach
+                    # For now, skip Pegasus for local storage
+                    logger.warning("Pegasus analysis requires S3 storage. Skipping for local video.")
+                    s3_uri = None
+                else:
+                    s3_uri = None
+                
+                if s3_uri:
+                    # Call Pegasus via Bedrock
+                    pegasus_analytics = pegasus_service.generate_pegasus_analytics(
+                        video_id=str(video_id),
+                        s3_uri=s3_uri,
+                        s3_bucket=video.s3_bucket
+                    )
+                    
+                    logger.info(
+                        "Successfully generated Pegasus analysis for video %s: %d shots detected",
+                        video_id,
+                        pegasus_analytics.get("total_shots", 0)
+                    )
+                    
+                    # Publish Pegasus analysis to Redis for WebSocket delivery
+                    _publish_video_analysis_sync(
+                        video_id,
+                        {
+                            "type": "pegasus_analysis",
+                            "video_id": video_id,
+                            "data": pegasus_analytics,
+                            "done": False
+                        }
+                    )
+                    
+            except Exception as e:
+                logger.error(
+                    "Failed to generate Pegasus analysis for video %s: %s",
+                    video_id,
+                    e,
+                    exc_info=True,
+                )
+                # Continue with keypoints extraction even if Pegasus fails
+        
+        update_video_progress(video_id, 30)
+
+        # Step 6: Run pose model (RTMPose) in batches
         logger.info("Running RTMPose over video frames in batches")
         
         batch_size = settings.BATCH_SIZE or 16
@@ -551,8 +608,8 @@ def analyze_video_job(video_id: str):
                 
                 # Progress update after each batch
                 if total_frames:
-                    progress = 25 + int(25 * processed_frames / max(total_frames, 1))
-                    update_video_progress(video_id, min(progress, 50))
+                    progress = 30 + int(25 * processed_frames / max(total_frames, 1))
+                    update_video_progress(video_id, min(progress, 55))
                 
                 logger.info(
                     f"Processed batch: {len(batch)} frames, total processed: {processed_frames}/{total_frames or 'unknown'}"
@@ -565,9 +622,9 @@ def analyze_video_job(video_id: str):
         # a list of per-frame dicts with persons, keypoints, scores, bbox, etc.
         keypoints_data = frames_results
 
-        update_video_progress(video_id, 50)
+        update_video_progress(video_id, 55)
         
-        # Step 6: Save keypoints JSON and binary format
+        # Step 7: Save keypoints JSON and binary format
         logger.info("Saving keypoints data")
         import json
         import msgpack
@@ -635,7 +692,7 @@ def analyze_video_job(video_id: str):
         
         update_video_progress(video_id, 70)
         
-        # Step 7: Generate overlay MP4 and upload it
+        # Step 8: Generate overlay MP4 and upload it
         logger.info("Generating overlay video with skeletons for all detected persons")
         
         # Create overlay video path
@@ -679,57 +736,39 @@ def analyze_video_job(video_id: str):
             # Continue processing even if overlay generation fails
             overlay_s3_key = None
         
-        update_video_progress(video_id, 85)
+        update_video_progress(video_id, 80)
         
-        # Step 8: Compute and store high-level pose metrics for Bedrock / UI
+        # Step 9: Compute and store high-level pose metrics for UI
         from services.video_pose_metrics import compute_video_pose_metrics
         logger.info("Computing aggregated pose metrics for video %s", video_id)
         metrics = compute_video_pose_metrics(keypoints_data=keypoints_data, video_id=video_id)
 
 
-        # Optionally, generate Bedrock analytics immediately after metrics are ready.
-        # This allows the frontend to fetch a pre-computed analytics JSON instead of
-        # invoking Bedrock on every request.
-        analytics = None
-        if settings.BEDROCK_REGION and settings.BEDROCK_MODEL_ID:
-            try:
-                logger.info("Generating Bedrock analytics for video %s", video_id)
-                analytics_service = get_video_analytics_service()
-                analytics = analytics_service.generate_analytics(
-                    video_id=str(video_id),
-                    metrics=metrics,
-                )
-                logger.info("Successfully generated Bedrock analytics for video %s", video_id)
-            except Exception as e:
-                logger.error(
-                    "Failed to generate Bedrock analytics for video %s: %s",
-                    video_id,
-                    e,
-                    exc_info=True,
-                )
-
-        # If analytics were generated, embed them under 'bedrock_analytics' so both
-        # raw metrics and AI commentary are available from a single JSON blob.
+        # Combine metrics with Pegasus analytics (if available)
+        # We no longer generate Bedrock analytics from keypoints; rely on Pegasus only
         metrics_payload = dict(metrics)
-        if analytics is not None:
-            metrics_payload["bedrock_analytics"] = analytics
+        
+        if pegasus_analytics is not None:
+            # Use Pegasus analytics as the primary analysis
+            metrics_payload["pegasus_analytics"] = pegasus_analytics
+            logger.info("Stored Pegasus analytics in metrics payload for video %s", video_id)
 
         update_video_outputs(video_id, metrics_jsonb=metrics_payload)
         update_video_progress(video_id, 95)
         
-        # Publish bedrock analysis to Redis for WebSocket delivery
-        if analytics is not None:
+        # Publish final analysis to Redis for WebSocket delivery
+        if pegasus_analytics is not None:
             _publish_video_analysis_sync(
                 video_id,
                 {
-                    "type": "bedrock_analysis",
+                    "type": "pegasus_analysis",
                     "video_id": video_id,
-                    "data": analytics,
+                    "data": pegasus_analytics,
                     "done": True
                 }
             )
         
-        # Step 9: Set status to SUCCEEDED
+        # Step 10: Set status to SUCCEEDED
         if mark_video_completed(video_id):
             logger.info(f"Successfully completed video analysis for {video_id}")
         else:
