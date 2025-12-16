@@ -7,6 +7,7 @@ import logging
 import os
 import socket
 import tempfile
+import threading
 from typing import Optional
 from pathlib import Path
 
@@ -512,52 +513,70 @@ def analyze_video_job(video_id: str):
 
         update_video_progress(video_id, 25)
 
-        # Step 5: Generate Pegasus analysis from S3 URL via Bedrock (before keypoints extraction)
-        pegasus_analytics = None
-        if settings.BEDROCK_REGION and (settings.BEDROCK_PEGASUS_MODEL_ID or settings.BEDROCK_MODEL_ID):
+        # Step 5: Generate Pegasus analysis from S3 URL via Bedrock.
+        # Run this in a background thread so that keypoint extraction can proceed
+        # even if Pegasus is slow or fails.
+        pegasus_analytics_container: Dict[str, Any] = {"value": None}
+        pegasus_thread: Optional[threading.Thread] = None
+
+        def _run_pegasus_analysis():
+            """
+            Background task that generates Pegasus analytics.
+            It logs and publishes errors but never raises, so it cannot block
+            keypoint extraction or cause the whole job to fail.
+            """
+            nonlocal pegasus_analytics_container
+
+            if not (settings.BEDROCK_REGION and (settings.BEDROCK_PEGASUS_MODEL_ID or settings.BEDROCK_MODEL_ID)):
+                logger.info("Pegasus analysis is not configured; skipping.")
+                return
+
             try:
                 logger.info("Generating Pegasus analysis for video %s via Bedrock", video_id)
                 from services.video_analytics_service import get_pegasus_service
-                from services.s3_service import s3_service
-                
+
                 pegasus_service = get_pegasus_service()
-                
+
                 # Generate S3 URI for Pegasus (Pegasus uses S3 URIs, not presigned URLs)
-                if storage_type == 's3' and video.s3_raw_key and video.s3_bucket:
+                if storage_type == "s3" and video.s3_raw_key and video.s3_bucket:
                     s3_uri = f"s3://{video.s3_bucket}/{video.s3_raw_key}"
-                elif storage_type == 'local' and video.local_file_path:
+                elif storage_type == "local" and video.local_file_path:
                     # For local storage, we'd need to upload to S3 first or use a different approach
-                    # For now, skip Pegasus for local storage
                     logger.warning("Pegasus analysis requires S3 storage. Skipping for local video.")
                     s3_uri = None
                 else:
                     s3_uri = None
-                
-                if s3_uri:
-                    # Call Pegasus via Bedrock
-                    pegasus_analytics = pegasus_service.generate_pegasus_analytics(
-                        video_id=str(video_id),
-                        s3_uri=s3_uri,
-                        s3_bucket=video.s3_bucket
-                    )
-                    
-                    logger.info(
-                        "Successfully generated Pegasus analysis for video %s: %d shots detected",
-                        video_id,
-                        pegasus_analytics.get("total_shots", 0)
-                    )
-                    
-                    # Publish Pegasus analysis to Redis for WebSocket delivery
-                    _publish_video_analysis_sync(
-                        video_id,
-                        {
-                            "type": "pegasus_analysis",
-                            "video_id": video_id,
-                            "data": pegasus_analytics,
-                            "done": False
-                        }
-                    )
-                    
+
+                if not s3_uri:
+                    logger.info("No valid S3 URI available for Pegasus; skipping analysis.")
+                    return
+
+                # Call Pegasus via Bedrock
+                pegasus_analytics = pegasus_service.generate_pegasus_analytics(
+                    video_id=str(video_id),
+                    s3_uri=s3_uri,
+                    s3_bucket=video.s3_bucket,
+                )
+
+                pegasus_analytics_container["value"] = pegasus_analytics
+
+                logger.info(
+                    "Successfully generated Pegasus analysis for video %s: %d shots detected",
+                    video_id,
+                    pegasus_analytics.get("total_shots", 0),
+                )
+
+                # Publish Pegasus analysis to Redis for WebSocket delivery
+                _publish_video_analysis_sync(
+                    video_id,
+                    {
+                        "type": "pegasus_analysis",
+                        "video_id": video_id,
+                        "data": pegasus_analytics,
+                        "done": False,
+                    },
+                )
+
             except Exception as e:
                 logger.error(
                     "Failed to generate Pegasus analysis for video %s: %s",
@@ -589,7 +608,7 @@ def analyze_video_job(video_id: str):
                         )
 
                 # Send an error message over the analysis stream so the frontend can
-                # stop processing and show the correct reason without guessing.
+                # show the correct reason without guessing. Do NOT raise.
                 try:
                     _publish_video_analysis_sync(
                         video_id,
@@ -603,10 +622,10 @@ def analyze_video_job(video_id: str):
                 except Exception:
                     logger.exception("Failed to publish Pegasus error for video %s", video_id)
 
-                # Stop further analysis (pose, metrics, etc.) and let the outer handler
-                # mark the video as failed with this message.
-                raise RuntimeError(error_message) from e
-        
+        # Start Pegasus analysis in the background (if configured)
+        pegasus_thread = threading.Thread(target=_run_pegasus_analysis, name=f"pegasus-{video_id}", daemon=True)
+        pegasus_thread.start()
+
         update_video_progress(video_id, 30)
 
         # Step 6: Run pose model (RTMPose) in batches
@@ -807,8 +826,16 @@ def analyze_video_job(video_id: str):
         metrics = compute_video_pose_metrics(keypoints_data=keypoints_data, video_id=video_id)
 
 
-        # Combine metrics with Pegasus analytics (if available)
-        # We no longer generate Bedrock analytics from keypoints; rely on Pegasus only
+        # Attempt to join Pegasus thread briefly so we can include analytics if ready,
+        # but do not block keypoint-based metrics if Pegasus is still running.
+        if pegasus_thread is not None and pegasus_thread.is_alive():
+            # Non-blocking check (timeout=0) – just give the scheduler a chance.
+            pegasus_thread.join(timeout=0)
+
+        pegasus_analytics = pegasus_analytics_container.get("value")
+
+        # Combine metrics with Pegasus analytics (if available).
+        # We no longer generate Bedrock analytics from keypoints; rely on Pegasus only.
         metrics_payload = dict(metrics)
         
         if pegasus_analytics is not None:
@@ -818,18 +845,6 @@ def analyze_video_job(video_id: str):
 
         update_video_outputs(video_id, metrics_jsonb=metrics_payload)
         update_video_progress(video_id, 95)
-        
-        # Publish final analysis to Redis for WebSocket delivery
-        if pegasus_analytics is not None:
-            _publish_video_analysis_sync(
-                video_id,
-                {
-                    "type": "pegasus_analysis",
-                    "video_id": video_id,
-                    "data": pegasus_analytics,
-                    "done": True
-                }
-            )
         
         # Step 10: Set status to SUCCEEDED
         if mark_video_completed(video_id):
