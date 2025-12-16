@@ -130,24 +130,10 @@ class VideoWebSocketManager:
                 "type": "bedrock_analysis",
                 "video_id": video_id,
                 "data": bedrock_analysis,
-                "done": True
+                # 'done' is managed at the Redis publisher level; here we just forward
+                "done": bedrock_analysis.get("done", False) if isinstance(bedrock_analysis, dict) else False,
             }
         )
-        
-        # Send final close message
-        await self._send_message(
-            video_id,
-            {
-                "type": "complete",
-                "video_id": video_id,
-                "message": "Analysis complete. You may close the connection."
-            }
-        )
-
-        # After sending the final completion message, proactively close and
-        # clean up the WebSocket connection so that keepalive pings stop and
-        # the client knows no further data will be sent.
-        await self.disconnect(video_id)
 
     async def _send_message(self, video_id: str, message: dict):
         """

@@ -448,7 +448,37 @@ def analyze_video_job(video_id: str):
             logger.info(f"Downloading video from S3: {video.s3_raw_key}")
             temp_dir = tempfile.mkdtemp(prefix=f"video_{video_id}_")
             video_path = os.path.join(temp_dir, os.path.basename(video.s3_raw_key) or "video.mp4")
-            download_from_s3(video.s3_raw_key, video_path)
+            try:
+                download_from_s3(video.s3_raw_key, video_path)
+            except Exception as e:
+                # Classify timeout vs generic download failure
+                msg = str(e) if e else ""
+                is_timeout = "timed out" in msg.lower() or "timeout" in msg.lower()
+                error_code = "download_timeout" if is_timeout else "download_error"
+                error_message = (
+                    "Googli AI could not download your video from secure storage due to a network timeout. "
+                    "Please try again in a few minutes."
+                    if is_timeout
+                    else "Googli AI could not download your video from secure storage. "
+                         "Please try again; if the problem persists, re-upload the video."
+                )
+
+                # Send an error message over the analysis stream so the frontend can stop processing
+                try:
+                    _publish_video_analysis_sync(
+                        video_id,
+                        {
+                            "type": "error",
+                            "video_id": video_id,
+                            "message": error_message,
+                            "error_code": error_code,
+                        },
+                    )
+                except Exception:
+                    logger.exception("Failed to publish download error for video %s", video_id)
+
+                # Mark video as failed via outer handler and abort further analysis
+                raise RuntimeError(error_message) from e
         
         update_video_progress(video_id, 15)
         
@@ -464,11 +494,12 @@ def analyze_video_job(video_id: str):
         width = video_processor.info.width or (metadata.get("width") if metadata else None)
         height = video_processor.info.height or (metadata.get("height") if metadata else None)
         total_frames = video_processor.info.total_frames or None
+        video_duration_seconds = video_processor.info.duration_seconds or (metadata.get("duration_seconds") if metadata else None)
 
         # Update DB metadata
         update_video_metadata(
             video_id,
-            duration_seconds=video_processor.info.duration_seconds or (metadata.get("duration_seconds") if metadata else None),
+            duration_seconds=video_duration_seconds,
             original_fps=fps,
             width=width,
             height=height,
@@ -534,14 +565,54 @@ def analyze_video_job(video_id: str):
                     e,
                     exc_info=True,
                 )
-                # Continue with keypoints extraction even if Pegasus fails
+                # Derive a user-friendly error reason based on video length
+                error_code = "pegasus_error"
+                error_message = (
+                    "Googli AI could not analyse this video due to an internal Pegasus error. "
+                    "Please try again in a few minutes."
+                )
+
+                min_duration = 2.0
+                max_duration = 60.0
+                if isinstance(video_duration_seconds, (int, float)):
+                    if video_duration_seconds < min_duration:
+                        error_code = "video_too_short"
+                        error_message = (
+                            "This video is too short for reliable analysis. "
+                            f"Please upload a longer batting clip of at least {min_duration:.0f} seconds."
+                        )
+                    elif video_duration_seconds > max_duration:
+                        error_code = "video_too_long"
+                        error_message = (
+                            "This video is too long for detailed technique analysis. "
+                            f"Please upload a shorter batting clip under {max_duration:.0f} seconds focusing on a few shots."
+                        )
+
+                # Send an error message over the analysis stream so the frontend can
+                # stop processing and show the correct reason without guessing.
+                try:
+                    _publish_video_analysis_sync(
+                        video_id,
+                        {
+                            "type": "error",
+                            "video_id": video_id,
+                            "message": error_message,
+                            "error_code": error_code,
+                        },
+                    )
+                except Exception:
+                    logger.exception("Failed to publish Pegasus error for video %s", video_id)
+
+                # Stop further analysis (pose, metrics, etc.) and let the outer handler
+                # mark the video as failed with this message.
+                raise RuntimeError(error_message) from e
         
         update_video_progress(video_id, 30)
 
         # Step 6: Run pose model (RTMPose) in batches
         logger.info("Running RTMPose over video frames in batches")
         
-        batch_size = settings.BATCH_SIZE or 16
+        batch_size = settings.BATCH_SIZE or 24
         
         frames_results = []
         processed_frames = 0
@@ -652,32 +723,24 @@ def analyze_video_job(video_id: str):
         binary_size = os.path.getsize(keypoints_binary_path)
         logger.info(f"Keypoints JSON size: {keypoints_size} bytes, Binary size: {binary_size} bytes")
         
-        # Store based on storage type
+        # Store outputs; we no longer upload keypoints JSON to S3.
         if storage_type == 'local':
-            # Store locally
+            # Store locally (binary path used for downloadable analysis if needed)
             update_video_outputs(
                 video_id,
-                keypoints_local_path=str(keypoints_binary_path),  # Store binary path
+                keypoints_local_path=str(keypoints_binary_path),
                 analysis_binary_path=str(keypoints_binary_path),
             )
         else:
-            # Upload to S3
-            keypoints_s3_key = f"keypoints/{video_id}/keypoints.json"
-            keypoints_binary_s3_key = f"keypoints/{video_id}/keypoints.msgpack.gz"
-            
-            upload_to_s3(str(keypoints_json_path), keypoints_s3_key, "application/json")
-            upload_to_s3(str(keypoints_binary_path), keypoints_binary_s3_key, "application/octet-stream")
-            
-            if keypoints_size <= 1024 * 1024:  # <= 1MB, can store inline
+            # For S3 videos, keep keypoints only for downstream processing; avoid S3 storage.
+            keypoints_jsonb = None
+            if keypoints_size <= 1024 * 1024:  # <= 1MB, can store inline in DB
                 with open(keypoints_json_path, 'r') as f:
                     keypoints_jsonb = json.load(f)
-                update_video_outputs(
-                    video_id,
-                    keypoints_s3_key=keypoints_s3_key,
-                    keypoints_jsonb=keypoints_jsonb,
-                )
-            else:
-                update_video_outputs(video_id, keypoints_s3_key=keypoints_s3_key)
+            update_video_outputs(
+                video_id,
+                keypoints_jsonb=keypoints_jsonb,
+            )
         
         # Publish keypoints to Redis for WebSocket delivery
         _publish_video_analysis_sync(
