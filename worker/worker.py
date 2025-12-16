@@ -23,8 +23,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-async def main():
-    """Main worker entry point (ARQ async worker)"""
+async def main(num_workers: int = 2):
+    """Main worker entry point (ARQ async worker)
+
+    Args:
+        num_workers: Number of ARQ worker instances to run in this process.
+            Each worker pulls jobs from the same Redis queue ("video-processing").
+            Jobs are claimed atomically by ARQ, so a given job/video will only be
+            processed by a single worker, even when multiple workers are running.
+    """
     logger.info("=" * 50)
     logger.info("🚀 Starting ARQ Worker for Video Processing")
     logger.info("=" * 50)
@@ -98,24 +105,38 @@ async def main():
         # Add password if available
         if password:
             redis_settings.password = password
-        redis = await create_pool(redis_settings)
+        # Establish a connection pool once to validate connectivity; individual
+        # workers will use redis_settings to manage their own connections.
+        await create_pool(redis_settings)
         logger.info("✅ Redis connection pool established for ARQ")
 
-        # Configure and start ARQ worker
-        worker = ArqWorker(
-            functions=["worker.jobs.analyze_video.analyze_video_job_async"],
-            redis_settings=redis_settings,
-            queue_name="video-processing",
-            burst=False,
+        # Configure and start one or more ARQ workers in this process.
+        # ARQ/Redis ensure that each enqueued job is claimed by exactly one worker,
+        # so multiple workers will NOT process the same video job concurrently.
+        workers = [
+            ArqWorker(
+                functions=["worker.jobs.analyze_video.analyze_video_job_async"],
+                redis_settings=redis_settings,
+                queue_name="video-processing",
+                burst=False,
+            )
+            for _ in range(max(1, int(num_workers)))
+        ]
+
+        logger.info("=" * 50)
+        logger.info(
+            "✅ ARQ Workers started (count=%d, queue=%s)",
+            len(workers),
+            "video-processing",
         )
         logger.info("=" * 50)
-        logger.info(f"✅ ARQ Worker started (queue: video-processing)")
-        logger.info("=" * 50)
-        logger.info("Worker is ready to process jobs...")
+        logger.info("Workers are ready to process jobs...")
         logger.info("Press Ctrl+C to stop")
         logger.info("=" * 50)
 
-        await worker.async_run()
+        import asyncio as _asyncio
+
+        await _asyncio.gather(*(w.async_run() for w in workers))
 
     except KeyboardInterrupt:
         logger.info("\n🛑 Worker stopped by user")
@@ -126,5 +147,21 @@ async def main():
 
 if __name__ == "__main__":
     import asyncio
-    asyncio.run(main())
+    # Optional CLI argument: number of workers to run in this process.
+    # Usage:
+    #   python -m worker.worker           # starts 2 workers (default)
+    #   python -m worker.worker 3         # starts 3 workers
+    default_workers = 2
+    num_workers = default_workers
+    if len(sys.argv) > 1:
+        try:
+            num_workers = int(sys.argv[1])
+        except ValueError:
+            logger.warning(
+                "Invalid num_workers argument %r, falling back to default=%d",
+                sys.argv[1],
+                default_workers,
+            )
+
+    asyncio.run(main(num_workers=num_workers))
 

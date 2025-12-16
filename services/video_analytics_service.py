@@ -52,6 +52,13 @@ class VideoAnalyticsService:
             self.model_id.startswith("anthropic.") or
             "claude" in self.model_id.lower()
         )
+    
+    def _is_pegasus_model(self) -> bool:
+        """Check if the model is a 12 Labs Pegasus model."""
+        return self.model_id and (
+            "pegasus" in self.model_id.lower() or
+            "twelvelabs" in self.model_id.lower()
+        )
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -74,6 +81,43 @@ class VideoAnalyticsService:
         prompt = self._build_prompt(video_id, metrics)
         raw_text = self._invoke_bedrock(prompt)
         return self._parse_json_response(raw_text)
+    
+    def generate_pegasus_analytics(
+        self,
+        video_id: str,
+        s3_uri: str,
+        s3_bucket: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Generate shot-wise analytics using Pegasus model from S3 URI.
+        
+        Pegasus can analyze videos directly from S3 and generate
+        shot-wise observations and suggestions.
+        
+        Args:
+            video_id: Video identifier
+            s3_uri: S3 URI (s3://bucket/key) or S3 key (if bucket provided)
+            s3_bucket: S3 bucket name (if s3_uri is just a key)
+            
+        Returns:
+            Analytics JSON with shot-wise analysis matching the standard format
+        """
+        logger.info(f"Generating Pegasus analysis for video {video_id} from S3")
+        
+        # Build full S3 URI if needed
+        if not s3_uri.startswith("s3://"):
+            if not s3_bucket:
+                raise ValueError("Either provide full s3:// URI or both s3_bucket and s3_uri (key)")
+            s3_uri = f"s3://{s3_bucket}/{s3_uri}"
+        
+        # Build prompt for Pegasus video analysis
+        prompt = self._build_pegasus_prompt(video_id)
+        
+        # Invoke Bedrock with Pegasus model
+        raw_text = self._invoke_bedrock_pegasus(prompt, s3_uri)
+        
+        # Parse and structure the response (with confidence filtering)
+        return self._parse_pegasus_response(video_id, raw_text)
 
     # ------------------------------------------------------------------ #
     # Internal helpers
@@ -411,6 +455,207 @@ class VideoAnalyticsService:
                 pass
         
         return raw_body.strip()
+    
+    def _build_pegasus_prompt(self, video_id: str) -> str:
+        """
+        Build prompt for Pegasus video analysis.
+        
+        Pegasus can analyze videos directly, so we provide instructions
+        for shot detection and analysis.
+        """
+        return (
+            "Analyze this cricket batting video and provide detailed shot-wise analysis. "
+            "Detect all shots in the video and for each shot provide:\n\n"
+            "1. Shot timing (start and end time in seconds)\n"
+            "2. Key observations about the batting technique\n"
+            "3. Specific suggestions for improvement\n"
+            "4. Shot type classification (if identifiable: drive, cut, pull, etc.)\n"
+            "5. A confidence score (0-1) for each shot classification and observations\n\n"
+            "Focus on:\n"
+            "- Stance and balance\n"
+            "- Backlift and bat path\n"
+            "- Footwork and weight transfer\n"
+            "- Swing path and follow through\n"
+            "- Overall technique quality\n\n"
+            "Provide observations in plain, coaching-friendly language. "
+            "Use British English (UK) spelling and terminology.\n\n"
+            "Important constraints:\n"
+            "- Include a boolean field is_cricket_video to indicate if this is a cricket batting video.\n"
+            "- Include confidence per shot (0-1). Only include shots with confidence >= 0.8.\n"
+            "- Include a confidence value for overall classification that this is cricket (0-1).\n\n"
+            "Return a JSON object with this structure:\n"
+            "{\n"
+            '  "video_id": "' + video_id + '",\n'
+            '  "is_cricket_video": <true|false>,\n'
+            '  "cricket_confidence": <0-1>,\n'
+            '  "total_shots": <number>,\n'
+            '  "shots": [\n'
+            '    {\n'
+            '      "shot_number": <1-indexed>,\n'
+            '      "start_time": <seconds>,\n'
+            '      "end_time": <seconds>,\n'
+            '      "shot_type": "<type or null>",\n'
+            '      "confidence": <0-1>,\n'
+            '      "observations": ["<observation 1>", "<observation 2>", ...],\n'
+            '      "suggestions": ["<suggestion 1>", "<suggestion 2>", ...]\n'
+            '    }\n'
+            '  ],\n'
+            '  "summary": {\n'
+            '    "overall_score": <0-10>,\n'
+            '    "skill_level": "<beginner|intermediate|advanced>",\n'
+            '    "headline": "<summary sentence>"\n'
+            '  },\n'
+            '  "key_observations": [\n'
+            '    {\n'
+            '      "title": "Stance and Balance",\n'
+            '      "score": <0-10>,\n'
+            '      "description": "<2-3 sentences>"\n'
+            '    },\n'
+            '    {\n'
+            '      "title": "Backlift and Bat Path",\n'
+            '      "score": <0-10>,\n'
+            '      "description": "<2-3 sentences>"\n'
+            '    },\n'
+            '    {\n'
+            '      "title": "Footwork and Weight Transfer",\n'
+            '      "score": <0-10>,\n'
+            '      "description": "<2-3 sentences>"\n'
+            '    },\n'
+            '    {\n'
+            '      "title": "Swing Path and Follow Through",\n'
+            '      "score": <0-10>,\n'
+            '      "description": "<2-3 sentences>"\n'
+            '    }\n'
+            '  ],\n'
+            '  "improvement_areas": [\n'
+            '    {\n'
+            '      "title": "<aspect>",\n'
+            '      "detail": "<2-3 sentences>",\n'
+            '      "priority": "<high|medium|low>"\n'
+            '    }\n'
+            '  ],\n'
+            '  "suggested_drills": [\n'
+            '    {\n'
+            '      "name": "<drill name>",\n'
+            '      "focus_area": "<bat_control|balance|footwork|alignment|weight_transfer>",\n'
+            '      "description": "<2-3 sentences>"\n'
+            '    }\n'
+            '  ],\n'
+            '  "explanation": {\n'
+            '    "long_form": "<3-4 sentences>",\n'
+            '    "notes": ["<tip 1>", "<tip 2>", "<tip 3>"]\n'
+            '  }\n'
+            "}\n"
+        )
+    
+    def _invoke_bedrock_pegasus(self, prompt: str, s3_uri: str) -> str:
+        """
+        Invoke Bedrock with Pegasus model for video analysis.
+        
+        Pegasus models use S3 URIs for video input.
+        Format based on Bedrock Pegasus API documentation.
+        """
+        # Extract bucket and key from S3 URI
+        if not s3_uri.startswith("s3://"):
+            raise ValueError(f"Invalid S3 URI format: {s3_uri}")
+        
+        uri_parts = s3_uri.replace("s3://", "").split("/", 1)
+        bucket = uri_parts[0]
+        key = uri_parts[1] if len(uri_parts) > 1 else ""
+        
+        # Pegasus minimal payload (InvokeModel)
+        body = json.dumps({
+            "mediaSource": {
+                "s3Location": {
+                    "uri": s3_uri,
+                    "bucketOwner": '195275642231'
+                }
+            },
+            "inputPrompt": prompt,
+        })
+        
+        try:
+            response = self.client.invoke_model(
+                modelId=self.model_id,
+                body=body,
+                contentType="application/json",
+                accept="application/json",
+            )
+        except (BotoCoreError, ClientError):
+            logger.exception("Bedrock invoke_model for Pegasus video analysis failed")
+            raise
+        
+        streaming_body = response.get("body")
+        if hasattr(streaming_body, "iter_chunks"):
+            chunks = []
+            for chunk in streaming_body.iter_chunks():
+                if chunk:
+                    chunks.append(chunk)
+            raw_body = b"".join(chunks)
+        else:
+            raw_body = streaming_body.read() if streaming_body else b""
+        
+        if isinstance(raw_body, (bytes, bytearray)):
+            raw_body = raw_body.decode("utf-8", errors="ignore")
+        
+        logger.debug("Pegasus raw response (truncated): %s", raw_body[:500])
+        return raw_body.strip()
+    
+    def _parse_pegasus_response(self, video_id: str, text: str) -> Dict[str, Any]:
+        """
+        Parse Pegasus response and ensure it matches the expected format.
+        """
+        # Parse JSON response
+        parsed = self._parse_json_response(text)
+
+        # Some Pegasus configs wrap the actual JSON in a "message" string field.
+        # If so, prefer the structured JSON inside "message".
+        if isinstance(parsed, dict) and isinstance(parsed.get("message"), str):
+            try:
+                inner = json.loads(parsed["message"])
+                if isinstance(inner, dict):
+                    parsed = inner
+            except json.JSONDecodeError:
+                # Keep original parsed if inner JSON is invalid
+                pass
+        
+        # Normalize cricket flags
+        cricket_conf = float(parsed.get("cricket_confidence", 0.0)) if isinstance(parsed, dict) else 0.0
+        parsed["cricket_confidence"] = cricket_conf
+        parsed["is_cricket_video"] = bool(parsed.get("is_cricket_video", cricket_conf >= 0.5))
+
+        # Ensure all required fields are present
+        # We no longer surface shot-level classification in the UI, so we
+        # normalise shots to an empty list to keep payload lightweight.
+        parsed["shots"] = []
+
+        if "summary" not in parsed:
+            parsed["summary"] = {
+                "overall_score": 5.0,
+                "skill_level": "intermediate",
+                "headline": "Technique analysis summary"
+            }
+        
+        if "key_observations" not in parsed:
+            parsed["key_observations"] = []
+        
+        if "improvement_areas" not in parsed:
+            parsed["improvement_areas"] = []
+        
+        if "suggested_drills" not in parsed:
+            parsed["suggested_drills"] = []
+        
+        if "explanation" not in parsed:
+            parsed["explanation"] = {
+                "long_form": "Video analysis completed.",
+                "notes": []
+            }
+        
+        # Ensure video_id is set
+        parsed["video_id"] = video_id
+        parsed["total_shots"] = len(parsed.get("shots", []))
+        
+        return parsed
 
     def _parse_json_response(self, text: str) -> Dict[str, Any]:
         """
@@ -420,7 +665,7 @@ class VideoAnalyticsService:
         - strip markdown fences/backticks
         - if parsing fails, try to extract the first {...} block
         """
-        cleaned = text.strip()
+        cleaned = (text or "").strip()
         if cleaned.startswith("```") and cleaned.endswith("```"):
             cleaned = cleaned.strip("`").strip()
 
@@ -430,7 +675,8 @@ class VideoAnalyticsService:
             # Best-effort: find first balanced {...} block
             start = cleaned.find("{")
             if start == -1:
-                raise
+                logger.warning("Pegasus response did not contain any JSON object")
+                return {}
             depth = 0
             for i in range(start, len(cleaned)):
                 if cleaned[i] == "{":
@@ -439,9 +685,14 @@ class VideoAnalyticsService:
                     depth -= 1
                     if depth == 0:
                         candidate = cleaned[start : i + 1]
-                        return json.loads(candidate)
-            # If we get here, re-raise the original error
-            raise
+                        try:
+                            return json.loads(candidate)
+                        except json.JSONDecodeError:
+                            logger.warning("Failed to parse extracted JSON candidate from Pegasus response")
+                            return {}
+            # If we get here, give up but don't raise – caller will handle empty dict
+            logger.warning("Unable to parse Pegasus response as JSON after best-effort extraction")
+            return {}
 
 
 _video_analytics_instance: Optional[VideoAnalyticsService] = None
@@ -470,6 +721,35 @@ def get_video_analytics_service() -> VideoAnalyticsService:
         )
 
     return _video_analytics_instance
+
+
+def get_pegasus_service() -> VideoAnalyticsService:
+    """
+    Get or create a VideoAnalyticsService configured for Pegasus model.
+    Uses BEDROCK_PEGASUS_MODEL_ID if set, otherwise falls back to BEDROCK_MODEL_ID.
+    """
+    if not settings.BEDROCK_REGION:
+        raise RuntimeError(
+            "Bedrock region not configured. "
+            "Set BEDROCK_REGION in the environment."
+        )
+    
+    # Use Pegasus model ID if configured, otherwise use default model ID
+    model_id = settings.BEDROCK_PEGASUS_MODEL_ID or settings.BEDROCK_MODEL_ID
+    
+    if not model_id:
+        raise RuntimeError(
+            "Pegasus model ID not configured. "
+            "Set BEDROCK_PEGASUS_MODEL_ID or BEDROCK_MODEL_ID in the environment."
+        )
+    
+    return VideoAnalyticsService(
+        model_id=model_id,
+        region=settings.BEDROCK_REGION,
+        temperature=settings.BEDROCK_TEMPERATURE,
+        top_p=settings.BEDROCK_TOP_P,
+        max_tokens=settings.BEDROCK_MAX_TOKENS,
+    )
 
 
 

@@ -15,8 +15,10 @@ import shutil
 import gzip
 import msgpack
 import asyncio
+import json
 from pathlib import Path
 from datetime import datetime
+from botocore.exceptions import BotoCoreError, ClientError
 
 from models.schemas import (
     PresignedUrlRequest,
@@ -238,6 +240,9 @@ async def get_presigned_upload_url(
             content_type=presigned_data["content_type"],
         )
         
+    except HTTPException as e:
+        # Preserve client-facing HTTP errors (e.g., S3 not configured)
+        raise e
     except RuntimeError as e:
         logger.error(f"Failed to generate presigned URL: {e}")
         raise HTTPException(
@@ -617,13 +622,15 @@ async def get_video_bedrock_analytics(
             detail="Metrics not found for this video."
         )
 
-    # If worker has already embedded Bedrock analytics under 'bedrock_analytics',
-    # return that directly without calling Bedrock again.
+    # If worker has already embedded Pegasus or Bedrock analytics, return that directly
     metrics_json = video.metrics_jsonb
-    existing_analytics = metrics_json.get("bedrock_analytics") if isinstance(metrics_json, dict) else None
-    if existing_analytics:
-        return existing_analytics
+    if isinstance(metrics_json, dict):
+        # Prefer Pegasus analytics if available (it's shot-wise and more detailed)
+        existing_analytics = metrics_json.get("pegasus_analytics") or metrics_json.get("bedrock_analytics")
+        if existing_analytics:
+            return existing_analytics
 
+    # Fallback to generating Bedrock analytics if not already available
     try:
         analytics_service = get_video_analytics_service()
     except RuntimeError as e:
@@ -761,6 +768,13 @@ async def _subscribe_and_forward_video_analysis(video_id: str):
                 logger.info(f"Forwarding bedrock analysis to WebSocket for video {video_id}")
                 await ws_manager.send_bedrock_analysis(video_id, bedrock_data)
                 logger.info(f"✅ Sent bedrock analysis to WebSocket for video {video_id}")
+                
+            elif message_type == "pegasus_analysis":
+                # Send Pegasus analysis (same format as bedrock for compatibility)
+                pegasus_data = message.get("data", {})
+                logger.info(f"Forwarding Pegasus analysis to WebSocket for video {video_id}")
+                await ws_manager.send_bedrock_analysis(video_id, pegasus_data)  # Use same method for compatibility
+                logger.info(f"✅ Sent Pegasus analysis to WebSocket for video {video_id}")
             else:
                 logger.warning(f"Unknown message type received: {message_type}")
                 

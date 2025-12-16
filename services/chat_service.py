@@ -34,8 +34,13 @@ class GoogliAIChatService:
                 "description": (
                     "Search for real-time cricket information including live scores, "
                     "recent match results, player statistics, team rankings, news, "
-                    "and upcoming fixtures. Use this when you need current information "
-                    "that may have changed recently or for live match updates."
+                    "and upcoming fixtures. ALWAYS use this tool when: "
+                    "1) The user asks about current/recent matches, scores, or events, "
+                    "2) The user asks about 'today', 'recent', 'latest', 'current', or 'now', "
+                    "3) You need up-to-date information that may have changed, "
+                    "4) The user asks about live match updates or recent news, "
+                    "5) You are uncertain about information that might be outdated. "
+                    "This tool provides the most current cricket information available."
                 ),
                 "inputSchema": {
                     "json": {
@@ -289,9 +294,10 @@ class GoogliAIChatService:
         tools_used = []
         
         # Configure tool use based on use_search parameter
-        tool_config = None
+        tool_config = True
         if use_search is False:
             # Disable tools
+            logger.info("Search tools DISABLED (use_search=False)")
             inference_config = {
                 "temperature": self.temperature,
                 "topP": self.top_p,
@@ -299,7 +305,13 @@ class GoogliAIChatService:
             }
         else:
             # Enable tools (default behavior or explicitly requested)
-            tool_config = {"tools": self.TOOLS}
+            # Check if Serper service is configured before enabling tools
+            if not self.serper_service.is_configured():
+                logger.warning("Search tools requested but Serper API is not configured. Tools will be disabled.")
+                tool_config = None
+            else:
+                tool_config = {"tools": self.TOOLS}
+                logger.info(f"Search tools ENABLED (use_search={use_search}). Tool config: {json.dumps(tool_config, indent=2)}")
             inference_config = {
                 "temperature": self.temperature,
                 "topP": self.top_p,
@@ -321,9 +333,13 @@ class GoogliAIChatService:
             
             if tool_config:
                 request_params["toolConfig"] = tool_config
+                logger.debug(f"Tool config added to request. Tools available: {len(self.TOOLS)}")
+            else:
+                logger.debug("No tool config in request")
             
             logger.debug(f"Making Bedrock API call with model: {self.model_id}, tone: {tone}")
             response = self.bedrock_client.converse(**request_params)
+            logger.debug(f"Bedrock response stopReason: {response.get('stopReason')}")
             
             # Handle tool use loop
             max_iterations = 5
@@ -456,13 +472,20 @@ class GoogliAIChatService:
         # Configure tool use
         tool_config = None
         if use_search is False:
+            logger.info("Search tools DISABLED for streaming (use_search=False)")
             inference_config = {
                 "temperature": self.temperature,
                 "topP": self.top_p,
                 "maxTokens": self.max_tokens
             }
         else:
-            tool_config = {"tools": self.TOOLS}
+            # Check if Serper service is configured before enabling tools
+            if not self.serper_service.is_configured():
+                logger.warning("Search tools requested for streaming but Serper API is not configured. Tools will be disabled.")
+                tool_config = None
+            else:
+                tool_config = {"tools": self.TOOLS}
+                logger.info(f"Search tools ENABLED for streaming (use_search={use_search})")
             inference_config = {
                 "temperature": self.temperature,
                 "topP": self.top_p,
@@ -483,6 +506,9 @@ class GoogliAIChatService:
             
             if tool_config:
                 request_params["toolConfig"] = tool_config
+                logger.debug(f"Tool config added to streaming request. Tools available: {len(self.TOOLS)}")
+            else:
+                logger.debug("No tool config in streaming request")
             
             logger.debug(f"Making Bedrock streaming API call with model: {self.model_id}, tone: {tone}")
             # Start streaming
