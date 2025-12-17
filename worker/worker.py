@@ -9,7 +9,7 @@ from redis import Redis
 from arq import Worker as ArqWorker
 from arq.connections import RedisSettings, create_pool
 from config import settings
-from worker.inference import get_pose_estimator
+from worker.inference import get_pose_estimator, get_person_detector
 
 # Configure logging
 logging.basicConfig(
@@ -46,6 +46,14 @@ async def main(num_workers: int = 2):
         )
     except Exception as pose_error:
         logger.error("❌ Failed to initialize RTMPose: %s", pose_error, exc_info=True)
+        sys.exit(1)
+    
+    # Warm up YOLO person detector so the model is resident before jobs arrive
+    try:
+        detector = get_person_detector()
+        logger.info("✅ YOLO person detector ready (model=%s)", detector.model_path)
+    except Exception as yolo_error:
+        logger.error("❌ Failed to initialize YOLO person detector: %s", yolo_error, exc_info=True)
         sys.exit(1)
     
     # Parse Redis URL or use defaults
