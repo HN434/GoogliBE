@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     # ===== GPU & Performance =====
     USE_GPU: bool = True
     DEVICE: str = os.getenv("DEVICE") # cuda, cpu, or mps (for Mac M1/M2)
-    BATCH_SIZE: int = 32
+    BATCH_SIZE: int = os.getenv("BATCH_SIZE", 32)
     NUM_WORKERS: int = 4
 
     # ===== Pose Detection Models =====
