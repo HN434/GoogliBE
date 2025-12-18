@@ -317,82 +317,6 @@ def _draw_skeletons_on_frame(
     return vis_frame
 
 
-def _generate_overlay_video(
-    video_path: str,
-    keypoints_data: List[Dict[str, Any]],
-    output_path: str,
-    progress_callback: Optional[callable] = None
-) -> None:
-    """
-    Generate overlay video with skeletons drawn for all detected persons.
-    
-    Args:
-        video_path: Path to input video
-        keypoints_data: List of frame data dictionaries with keypoints
-        output_path: Path to output overlay video
-        progress_callback: Optional callback function(progress_percent) for progress updates
-    """
-    logger.info(f"Generating overlay video: {video_path} -> {output_path}")
-    
-    # Create a dictionary mapping frame numbers to keypoints data for quick lookup
-    frame_data_map = {frame_data["frame_number"]: frame_data for frame_data in keypoints_data}
-    
-    # Open input video
-    video_processor = VideoProcessor(video_path)
-    width = video_processor.info.width
-    height = video_processor.info.height
-    fps = video_processor.info.fps
-    total_frames = video_processor.info.total_frames
-    
-    logger.info(f"Video info: {width}x{height} @ {fps} fps, {total_frames} frames")
-    
-    # Create output video writer
-    video_writer = VideoWriter(output_path, width, height, fps)
-    
-    try:
-        frame_count = 0
-        
-        # Process all frames from the video
-        for frame_num, frame in video_processor.frame_generator(sample_rate=1):
-            # Look up keypoints data for this frame
-            frame_data = frame_data_map.get(frame_num)
-            
-            if frame_data and frame_data.get("num_persons", 0) > 0:
-                # Convert keypoints data to PoseEstimatorResult format
-                pose_results = _convert_keypoints_data_to_results(frame_data)
-                num_persons = len(pose_results)
-                
-                # Draw skeletons for all detected persons
-                annotated_frame = _draw_skeletons_on_frame(frame, pose_results)
-                
-                if num_persons > 1:
-                    logger.debug(
-                        f"Frame {frame_num}: Drew skeletons for {num_persons} persons (multi-person detection)"
-                    )
-                else:
-                    logger.debug(
-                        f"Frame {frame_num}: Drew skeleton for {num_persons} person"
-                    )
-            else:
-                # No detections for this frame, use original frame
-                annotated_frame = frame
-            
-            # Write annotated frame to output video
-            video_writer.write_frame(annotated_frame)
-            frame_count += 1
-            
-            # Progress callback
-            if progress_callback and total_frames > 0:
-                progress = int(100 * frame_count / total_frames)
-                progress_callback(progress)
-        
-        logger.info(f"Successfully generated overlay video: {output_path} ({frame_count} frames)")
-        
-    finally:
-        video_writer.cleanup()
-        video_processor.cleanup()
-
-
 def analyze_video_job(video_id: str):
     """
     Worker-side job that processes a queued video.
@@ -632,81 +556,7 @@ def analyze_video_job(video_id: str):
             # Get person detector for batch detection
             person_detector = get_person_detector()
 
-            # ----- Warmup: run inference on a single frame -----
-            warmup_item = next(frame_iter, None)
-            if warmup_item is not None:
-                warmup_frame_num, warmup_frame = warmup_item
-                warmup_frames = [warmup_frame]
-                warmup_frame_nums = [warmup_frame_num]
-
-                # Batch person detection (even for single frame, uses optimized path)
-                detected_bboxes_batch = person_detector.detect_batch(warmup_frames)
-                detected_bboxes = detected_bboxes_batch[0] if detected_bboxes_batch else None
-
-                warmup_results_batch = pose_estimator.infer_batch(
-                    warmup_frames,
-                    person_bboxes_list=[detected_bboxes] if detected_bboxes else None,
-                    auto_detect=False,  # Use provided bboxes
-                )
-
-                # Process warmup results (same logic as main loop)
-                for frame_num, pose_results in zip(warmup_frame_nums, warmup_results_batch):
-                    # Log basic summary
-                    if pose_results:
-                        avg_conf = float(
-                            sum(r.mean_confidence for r in pose_results) / len(pose_results)
-                        )
-                        num_persons = len(pose_results)
-                        if num_persons > 1:
-                            logger.info(
-                                "Frame %d -> %d persons detected (multi-person) | mean conf=%.3f",
-                                frame_num,
-                                num_persons,
-                                avg_conf,
-                            )
-                        else:
-                            logger.info(
-                                "Frame %d -> %d person | mean conf=%.3f",
-                                frame_num,
-                                num_persons,
-                                avg_conf,
-                            )
-                    else:
-                        logger.info("Frame %d -> no detections", frame_num)
-
-                    # Build per-frame JSON structure
-                    frame_data = {
-                        "frame_number": frame_num,
-                        "num_persons": len(pose_results),
-                        "persons": [],
-                        "num_bats": 0,  # Bat detection disabled
-                        "bats": [],
-                    }
-
-                    # Add person data
-                    for i, result in enumerate(pose_results):
-                        person_data = {
-                            "person_id": i,
-                            "keypoints": result.keypoints.tolist(),
-                            "scores": result.scores.tolist(),
-                            "bbox": result.bbox,
-                            "mean_confidence": float(result.mean_confidence),
-                        }
-                        frame_data["persons"].append(person_data)
-
-                    frames_results.append(frame_data)
-
-                    total_persons += len(pose_results)
-                    processed_frames += 1
-
-                # Progress update after warmup frame
-                if total_frames:
-                    progress = 30 + int(25 * processed_frames / max(total_frames, 1))
-                    update_video_progress(video_id, min(progress, 55))
-
-                logger.info(
-                    f"Processed warmup batch: 1 frame, total processed: {processed_frames}/{total_frames or 'unknown'}"
-                )
+            # Skip warmup - start processing immediately with full batches for better GPU utilization
 
             # ----- Main loop: use configured batch size for remaining frames -----
             batch: list = []
@@ -737,64 +587,40 @@ def analyze_video_job(video_id: str):
                         )
                         pose_results_batch.append(results)
 
-                    # Process each frame in the batch
+                    # Process each frame in the batch (optimized - minimal logging)
                     for frame_num, pose_results in zip(frame_nums, pose_results_batch):
-                        # Log basic summary
-                        if pose_results:
-                            avg_conf = float(
-                                sum(r.mean_confidence for r in pose_results) / len(pose_results)
-                            )
-                            num_persons = len(pose_results)
-                            if num_persons > 1:
-                                logger.info(
-                                    "Frame %d -> %d persons detected (multi-person) | mean conf=%.3f",
-                                    frame_num,
-                                    num_persons,
-                                    avg_conf,
-                                )
-                            else:
-                                logger.info(
-                                    "Frame %d -> %d person | mean conf=%.3f",
-                                    frame_num,
-                                    num_persons,
-                                    avg_conf,
-                                )
-                        else:
-                            logger.info("Frame %d -> no detections", frame_num)
-
-                        # Build per-frame JSON structure
+                        # Build per-frame JSON structure (optimized)
                         frame_data = {
                             "frame_number": frame_num,
                             "num_persons": len(pose_results),
-                            "persons": [],
-                            "num_bats": 0,  # Bat detection disabled
+                            "persons": [
+                                {
+                                    "person_id": i,
+                                    "keypoints": result.keypoints.tolist(),
+                                    "scores": result.scores.tolist(),
+                                    "bbox": result.bbox,
+                                    "mean_confidence": float(result.mean_confidence),
+                                }
+                                for i, result in enumerate(pose_results)
+                            ],
+                            "num_bats": 0,
                             "bats": [],
                         }
 
-                        # Add person data
-                        for i, result in enumerate(pose_results):
-                            person_data = {
-                                "person_id": i,
-                                "keypoints": result.keypoints.tolist(),
-                                "scores": result.scores.tolist(),
-                                "bbox": result.bbox,
-                                "mean_confidence": float(result.mean_confidence),
-                            }
-                            frame_data["persons"].append(person_data)
-
                         frames_results.append(frame_data)
-
                         total_persons += len(pose_results)
                         processed_frames += 1
+                    
+                    # Log only once per batch (not per frame) for performance
+                    if processed_frames % (main_batch_size * 4) == 0 or processed_frames == total_frames:
+                        logger.info(
+                            f"Processed {processed_frames}/{total_frames or 'unknown'} frames, {total_persons} total persons detected"
+                        )
 
-                    # Progress update after each batch
-                    if total_frames:
+                    # Progress update less frequently (every 2 batches) to reduce overhead
+                    if total_frames and processed_frames % (main_batch_size * 2) == 0:
                         progress = 30 + int(25 * processed_frames / max(total_frames, 1))
                         update_video_progress(video_id, min(progress, 55))
-
-                    logger.info(
-                        f"Processed batch: {len(batch)} frames, total processed: {processed_frames}/{total_frames or 'unknown'}"
-                    )
 
                     # Clear GPU cache periodically to prevent memory fragmentation
                     if settings.CLEAR_GPU_CACHE and processed_frames % (main_batch_size * 2) == 0:
@@ -824,46 +650,24 @@ def analyze_video_job(video_id: str):
                     )
                     pose_results_batch.append(results)
 
+                # Process remaining frames (optimized - minimal logging)
                 for frame_num, pose_results in zip(frame_nums, pose_results_batch):
-                    if pose_results:
-                        avg_conf = float(
-                            sum(r.mean_confidence for r in pose_results) / len(pose_results)
-                        )
-                        num_persons = len(pose_results)
-                        if num_persons > 1:
-                            logger.info(
-                                "Frame %d -> %d persons detected (multi-person) | mean conf=%.3f",
-                                frame_num,
-                                num_persons,
-                                avg_conf,
-                            )
-                        else:
-                            logger.info(
-                                "Frame %d -> %d person | mean conf=%.3f",
-                                frame_num,
-                                num_persons,
-                                avg_conf,
-                            )
-                    else:
-                        logger.info("Frame %d -> no detections", frame_num)
-
                     frame_data = {
                         "frame_number": frame_num,
                         "num_persons": len(pose_results),
-                        "persons": [],
+                        "persons": [
+                            {
+                                "person_id": i,
+                                "keypoints": result.keypoints.tolist(),
+                                "scores": result.scores.tolist(),
+                                "bbox": result.bbox,
+                                "mean_confidence": float(result.mean_confidence),
+                            }
+                            for i, result in enumerate(pose_results)
+                        ],
                         "num_bats": 0,
                         "bats": [],
                     }
-
-                    for i, result in enumerate(pose_results):
-                        person_data = {
-                            "person_id": i,
-                            "keypoints": result.keypoints.tolist(),
-                            "scores": result.scores.tolist(),
-                            "bbox": result.bbox,
-                            "mean_confidence": float(result.mean_confidence),
-                        }
-                        frame_data["persons"].append(person_data)
 
                     frames_results.append(frame_data)
                     total_persons += len(pose_results)
@@ -872,10 +676,6 @@ def analyze_video_job(video_id: str):
                 if total_frames:
                     progress = 30 + int(25 * processed_frames / max(total_frames, 1))
                     update_video_progress(video_id, min(progress, 55))
-
-                logger.info(
-                    f"Processed final batch: {len(batch)} frames, total processed: {processed_frames}/{total_frames or 'unknown'}"
-                )
 
         finally:
             video_processor.cleanup()
@@ -886,138 +686,38 @@ def analyze_video_job(video_id: str):
 
         update_video_progress(video_id, 55)
 
-        # Publish full keypoints dataset to Redis for WebSocket delivery as soon
-        # as it's ready, before any disk I/O or downstream processing.
-        _publish_video_analysis_sync(
-            video_id,
-            {
-                "type": "keypoints",
-                "video_id": video_id,
-                "data": keypoints_data,
-                "done": True,
-            },
-        )
-        
-        # Step 7: Save keypoints JSON and binary format
-        logger.info("Saving keypoints data")
-        import json
-        import msgpack
-        import gzip
-        
-        # Create output directory
-        if storage_type == 'local':
-            output_dir = Path(video.local_file_path).parent
-        else:
-            output_dir = Path(temp_dir) if temp_dir else Path(tempfile.mkdtemp())
-        
-        keypoints_json_path = output_dir / f"{video_id}_keypoints.json"
-        keypoints_binary_path = output_dir / f"{video_id}_keypoints.msgpack.gz"
-        
-        # Save JSON
-        with open(keypoints_json_path, 'w') as f:
-            json.dump(keypoints_data, f, indent=2)
-        
-        # Save binary format (msgpack + gzip compression)
-        msgpack_data = msgpack.packb(keypoints_data, use_bin_type=True)
-        with gzip.open(keypoints_binary_path, 'wb') as f:
-            f.write(msgpack_data)
-        
-        keypoints_size = os.path.getsize(keypoints_json_path)
-        binary_size = os.path.getsize(keypoints_binary_path)
-        logger.info(f"Keypoints JSON size: {keypoints_size} bytes, Binary size: {binary_size} bytes")
-        
-        # Store outputs; we no longer upload keypoints JSON to S3.
-        if storage_type == 'local':
-            # Store locally (binary path used for downloadable analysis if needed)
-            update_video_outputs(
-                video_id,
-                keypoints_local_path=str(keypoints_binary_path),
-                analysis_binary_path=str(keypoints_binary_path),
-            )
-        else:
-            # For S3 videos, keep keypoints only for downstream processing; avoid S3 storage.
-            keypoints_jsonb = None
-            if keypoints_size <= 1024 * 1024:  # <= 1MB, can store inline in DB
-                with open(keypoints_json_path, 'r') as f:
-                    keypoints_jsonb = json.load(f)
-            update_video_outputs(
-                video_id,
-                keypoints_jsonb=keypoints_jsonb,
-            )
-        
-        update_video_progress(video_id, 70)
-        
-        # Step 8: Generate overlay MP4 and upload it
-        logger.info("Generating overlay video with skeletons for all detected persons")
-        
-        # Create overlay video path
-        if storage_type == 'local':
-            overlay_video_path = str(Path(video.local_file_path).parent / f"{video_id}_overlay.mp4")
-        else:
-            overlay_video_path = os.path.join(temp_dir, f"{video_id}_overlay.mp4")
-        
-        # Generate overlay video with progress updates
-        def overlay_progress_callback(progress_percent: int):
-            # Map overlay progress (0-100) to overall progress (70-85)
-            overall_progress = 70 + int(15 * progress_percent / 100)
-            update_video_progress(video_id, min(overall_progress, 85))
-        
-        try:
-            _generate_overlay_video(
-                video_path=video_path,
-                keypoints_data=keypoints_data,
-                output_path=overlay_video_path,
-                progress_callback=overlay_progress_callback
-            )
-            
-            # Upload or store overlay video
-            if storage_type == 'local':
-                # Store locally
-                update_video_outputs(
+        # Publish full keypoints dataset to Redis for WebSocket delivery
+        # Use background thread to avoid blocking
+        def _publish_keypoints_async():
+            try:
+                _publish_video_analysis_sync(
                     video_id,
-                    overlay_video_local_path=overlay_video_path,
+                    {
+                        "type": "keypoints",
+                        "video_id": video_id,
+                        "data": keypoints_data,
+                        "done": True,
+                    },
                 )
-                overlay_s3_key = None
-            else:
-                # Upload to S3
-                overlay_s3_key = f"overlays/{video_id}/overlay.mp4"
-                upload_to_s3(overlay_video_path, overlay_s3_key, "video/mp4")
-                update_video_outputs(video_id, overlay_video_s3_key=overlay_s3_key)
-            
-            logger.info(f"Successfully generated and stored overlay video for {video_id}")
-            
-        except Exception as e:
-            logger.error(f"Failed to generate overlay video: {e}", exc_info=True)
-            # Continue processing even if overlay generation fails
-            overlay_s3_key = None
+            except Exception as e:
+                logger.error(f"Failed to publish keypoints to Redis: {e}", exc_info=True)
         
-        update_video_progress(video_id, 80)
+        # Publish in background thread to not block completion
+        publish_thread = threading.Thread(target=_publish_keypoints_async, daemon=True)
+        publish_thread.start()
         
-        # Step 9: Compute and store high-level pose metrics for UI
-        from services.video_pose_metrics import compute_video_pose_metrics
-        logger.info("Computing aggregated pose metrics for video %s", video_id)
-        metrics = compute_video_pose_metrics(keypoints_data=keypoints_data, video_id=video_id)
-
-
-        # Attempt to join Pegasus thread briefly so we can include analytics if ready,
-        # but do not block keypoint-based metrics if Pegasus is still running.
+        update_video_progress(video_id, 95)
+        
+        # Wait for Pegasus analytics if available (non-blocking)
         if pegasus_thread is not None and pegasus_thread.is_alive():
-            # Non-blocking check (timeout=0) – just give the scheduler a chance.
             pegasus_thread.join(timeout=0)
 
         pegasus_analytics = pegasus_analytics_container.get("value")
-
-        # Combine metrics with Pegasus analytics (if available).
-        # We no longer generate Bedrock analytics from keypoints; rely on Pegasus only.
-        metrics_payload = dict(metrics)
         
+        # Store only Pegasus analytics if available (no pose metrics)
         if pegasus_analytics is not None:
-            # Use Pegasus analytics as the primary analysis
-            metrics_payload["pegasus_analytics"] = pegasus_analytics
-            logger.info("Stored Pegasus analytics in metrics payload for video %s", video_id)
-
-        update_video_outputs(video_id, metrics_jsonb=metrics_payload)
-        update_video_progress(video_id, 95)
+            update_video_outputs(video_id, metrics_jsonb={"pegasus_analytics": pegasus_analytics})
+            logger.info("Stored Pegasus analytics for video %s", video_id)
         
         # Step 10: Set status to SUCCEEDED
         if mark_video_completed(video_id):
