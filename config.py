@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     # ===== GPU & Performance =====
     USE_GPU: bool = True
     DEVICE: str = os.getenv("DEVICE") # cuda, cpu, or mps (for Mac M1/M2)
-    BATCH_SIZE: int = os.getenv("BATCH_SIZE", 32)
+    BATCH_SIZE: int = int(os.getenv("BATCH_SIZE", 16))  # Optimized for T4 GPU (16GB VRAM)
     NUM_WORKERS: int = 4
 
     # ===== Pose Detection Models =====
@@ -125,8 +125,8 @@ class Settings(BaseSettings):
 
     # ===== Advanced =====
     USE_TENSORRT: bool = False  # TensorRT acceleration (requires setup)
-    USE_HALF_PRECISION: bool = False  # FP16 for faster inference
-    CLEAR_GPU_CACHE: bool = True
+    USE_HALF_PRECISION: bool = os.getenv("USE_HALF_PRECISION", "true").lower() == "true"  # FP16 for faster inference (enabled by default for T4 GPU)
+    CLEAR_GPU_CACHE: bool = os.getenv("CLEAR_GPU_CACHE", "true").lower() == "true"  # Clear GPU cache periodically
 
     # ===== Commentary System =====
     REDIS_URL: str = os.getenv("REDIS_URL")

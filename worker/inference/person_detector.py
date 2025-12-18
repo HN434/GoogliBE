@@ -44,7 +44,18 @@ class PersonDetector:
         try:
             logger.info(f"Loading YOLO person detector: {self.model_path}")
             self.model = YOLO(self.model_path)
-            logger.info("✅ YOLO person detector loaded successfully")
+            
+            # Enable FP16 for faster inference on T4 GPU if configured
+            try:
+                from config import settings
+                import torch
+                if settings.USE_HALF_PRECISION and torch.cuda.is_available():
+                    # YOLO handles FP16 internally via the half parameter in predict calls
+                    logger.info("✅ YOLO person detector loaded (FP16 will be used in inference)")
+                else:
+                    logger.info("✅ YOLO person detector loaded successfully")
+            except Exception:
+                logger.info("✅ YOLO person detector loaded successfully")
         except Exception as e:
             logger.error(f"Failed to load YOLO model: {e}")
             raise
@@ -119,7 +130,20 @@ class PersonDetector:
         try:
             # YOLO supports batch inference - pass list of frames
             # This processes all frames on GPU in one call - much more efficient!
-            results = self.model(frames, conf=self.conf_threshold, verbose=False)
+            # Enable FP16 if configured for faster inference on T4 GPU
+            try:
+                from config import settings
+                import torch
+                use_half = settings.USE_HALF_PRECISION and torch.cuda.is_available()
+            except Exception:
+                use_half = False
+            
+            results = self.model(
+                frames, 
+                conf=self.conf_threshold, 
+                verbose=False,
+                half=use_half  # FP16 for faster inference
+            )
             
             batch_bboxes = []
             for result in results:

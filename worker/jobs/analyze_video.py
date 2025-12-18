@@ -618,8 +618,7 @@ def analyze_video_job(video_id: str):
         # reduce perceived latency, then switch to the configured batch size
         main_batch_size = settings.BATCH_SIZE or 24
         
-        # Import for parallel processing
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        # Import for batch person detection
         from worker.inference.person_detector import get_person_detector
         
         frames_results = []
@@ -630,22 +629,8 @@ def analyze_video_job(video_id: str):
             # Frame generator over the whole video (no additional sampling here)
             frame_iter = video_processor.frame_generator(sample_rate=None)
 
-            # Get person detector and pose estimator for parallel processing
+            # Get person detector for batch detection
             person_detector = get_person_detector()
-            
-            # Helper function to process a single frame with pose estimation
-            def process_single_frame(frame_num: int, frame: np.ndarray, bboxes: Optional[List[np.ndarray]]) -> Tuple[int, List[PoseEstimatorResult]]:
-                """Process a single frame with pose estimation"""
-                try:
-                    results = pose_estimator.infer(
-                        frame,
-                        person_bboxes=bboxes,
-                        auto_detect=False,  # Use provided bboxes
-                    )
-                    return frame_num, results
-                except Exception as e:
-                    logger.error(f"Error processing frame {frame_num}: {e}", exc_info=True)
-                    return frame_num, []
 
             # ----- Warmup: run inference on a single frame -----
             warmup_item = next(frame_iter, None)
@@ -726,9 +711,8 @@ def analyze_video_job(video_id: str):
             # ----- Main loop: use configured batch size for remaining frames -----
             batch: list = []
             
-            # Use ThreadPoolExecutor for parallel pose estimation
-            # Limit workers to avoid GPU memory issues (pose estimation is GPU-bound)
-            max_workers = min(4, main_batch_size)  # Process up to 4 frames concurrently
+            # Process frames sequentially - GPU operations are synchronous and don't benefit from threading
+            # ThreadPoolExecutor adds overhead for GPU-bound tasks
             
             for frame_num, frame in frame_iter:
                 batch.append((frame_num, frame))
@@ -741,28 +725,17 @@ def analyze_video_job(video_id: str):
                     # This detects persons on every frame, but processes them in one GPU call
                     detected_bboxes_batch = person_detector.detect_batch(frames)
                     
-                    # OPTIMIZATION 2: Parallel pose estimation using ThreadPoolExecutor
-                    # Process multiple frames concurrently for pose estimation
-                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                        # Submit all frames for parallel processing
-                        future_to_frame = {
-                            executor.submit(
-                                process_single_frame,
-                                frame_nums[i],
-                                frames[i],
-                                detected_bboxes_batch[i] if i < len(detected_bboxes_batch) else None
-                            ): frame_nums[i]
-                            for i in range(len(frames))
-                        }
-                        
-                        # Collect results as they complete
-                        frame_results_map = {}
-                        for future in as_completed(future_to_frame):
-                            frame_num_result, pose_results = future.result()
-                            frame_results_map[frame_num_result] = pose_results
-                        
-                        # Process results in frame order
-                        pose_results_batch = [frame_results_map[fn] for fn in frame_nums]
+                    # OPTIMIZATION 2: Sequential pose estimation (GPU handles parallelism internally)
+                    # Process all frames in batch sequentially - GPU is already parallelized
+                    pose_results_batch = []
+                    for i, frame_bgr in enumerate(frames):
+                        bboxes = detected_bboxes_batch[i] if i < len(detected_bboxes_batch) else None
+                        results = pose_estimator.infer(
+                            frame_bgr,
+                            person_bboxes=bboxes,
+                            auto_detect=False,
+                        )
+                        pose_results_batch.append(results)
 
                     # Process each frame in the batch
                     for frame_num, pose_results in zip(frame_nums, pose_results_batch):
@@ -823,6 +796,13 @@ def analyze_video_job(video_id: str):
                         f"Processed batch: {len(batch)} frames, total processed: {processed_frames}/{total_frames or 'unknown'}"
                     )
 
+                    # Clear GPU cache periodically to prevent memory fragmentation
+                    if settings.CLEAR_GPU_CACHE and processed_frames % (main_batch_size * 2) == 0:
+                        import torch
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                            logger.debug("Cleared GPU cache")
+
                     batch = []
 
             # Process any remaining frames that didn't fill a full batch
@@ -833,24 +813,16 @@ def analyze_video_job(video_id: str):
                 # Batch person detection for remaining frames
                 detected_bboxes_batch = person_detector.detect_batch(frames)
                 
-                # Parallel pose estimation for remaining frames
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    future_to_frame = {
-                        executor.submit(
-                            process_single_frame,
-                            frame_nums[i],
-                            frames[i],
-                            detected_bboxes_batch[i] if i < len(detected_bboxes_batch) else None
-                        ): frame_nums[i]
-                        for i in range(len(frames))
-                    }
-                    
-                    frame_results_map = {}
-                    for future in as_completed(future_to_frame):
-                        frame_num_result, pose_results = future.result()
-                        frame_results_map[frame_num_result] = pose_results
-                    
-                    pose_results_batch = [frame_results_map[fn] for fn in frame_nums]
+                # Sequential pose estimation for remaining frames
+                pose_results_batch = []
+                for i, frame_bgr in enumerate(frames):
+                    bboxes = detected_bboxes_batch[i] if i < len(detected_bboxes_batch) else None
+                    results = pose_estimator.infer(
+                        frame_bgr,
+                        person_bboxes=bboxes,
+                        auto_detect=False,
+                    )
+                    pose_results_batch.append(results)
 
                 for frame_num, pose_results in zip(frame_nums, pose_results_batch):
                     if pose_results:

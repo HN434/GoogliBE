@@ -110,6 +110,23 @@ class PoseEstimator:
                 checkpoint=str(checkpoint_path),
                 device=device,
             )
+            
+            # Enable FP16 for faster inference on T4 GPU if configured
+            try:
+                if settings.USE_HALF_PRECISION and device == "cuda":
+                    self.model = self.model.half()
+                    logger.info("RTMPose model converted to FP16 for faster inference")
+            except Exception as e:
+                logger.warning(f"Could not enable FP16: {e}")
+            
+            # Compile model for PyTorch 2.0+ (can give 10-20% speedup)
+            try:
+                if hasattr(torch, 'compile') and device == "cuda":
+                    self.model = torch.compile(self.model, mode='reduce-overhead')
+                    logger.info("RTMPose model compiled with torch.compile")
+            except Exception as e:
+                logger.debug(f"Could not compile model (this is optional): {e}")
+                
         finally:
             # Restore original torch.load
             torch.load = original_torch_load
