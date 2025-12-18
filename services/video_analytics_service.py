@@ -498,7 +498,7 @@ class VideoAnalyticsService:
             '  ],\n'
             '  "summary": {\n'
             '    "overall_score": <0-10>,\n'
-            '    "skill_level": "<beginner|intermediate|advanced>",\n'
+            '    "skill_level": "<beginner if 0-3|intermediate if 4-6|advanced if 7-10>",\n'
             '    "headline": "<summary sentence>",\n'
             '    "shot type": "<type of shot played in the video>"\n'
             '    "shot confidence": "<confidence in the shot type>"\n'
