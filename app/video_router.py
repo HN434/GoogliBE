@@ -775,6 +775,12 @@ async def _subscribe_and_forward_video_analysis(video_id: str):
                 logger.info(f"Forwarding Pegasus analysis to WebSocket for video {video_id}")
                 await ws_manager.send_bedrock_analysis(video_id, pegasus_data)  # Use same method for compatibility
                 logger.info(f"✅ Sent Pegasus analysis to WebSocket for video {video_id}")
+            elif message_type == "shot_classification":
+                # Send shot classification result (separate from Pegasus to avoid blocking)
+                shot_data = message.get("data", {})
+                logger.info(f"Forwarding shot classification to WebSocket for video {video_id}")
+                await ws_manager.send_shot_classification(video_id, shot_data)
+                logger.info(f"✅ Sent shot classification to WebSocket for video {video_id}")
             else:
                 logger.warning(f"Unknown message type received: {message_type}")
                 

@@ -14,7 +14,13 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from worker.inference import get_pose_estimator, PoseEstimatorResult
+from worker.inference import (
+    get_pose_estimator,
+    PoseEstimatorResult,
+    get_shot_classifier,
+    classify_shot_video,
+    SHOT_CLASSES,
+)
 from worker.utils.db import (
     get_video_by_id,
     update_video_status,
@@ -364,6 +370,8 @@ def analyze_video_job(video_id: str):
         # not block download or pose extraction.
         pegasus_analytics_container: Dict[str, Any] = {"value": None}
         pegasus_thread: Optional[threading.Thread] = None
+        # Shot classification background thread (initialized later once video_path is known)
+        shot_thread: Optional[threading.Thread] = None
 
         def _run_pegasus_analysis():
             """
@@ -502,6 +510,93 @@ def analyze_video_job(video_id: str):
                 raise RuntimeError(error_message) from e
         
         update_video_progress(video_id, 15)
+
+        # Kick off shot classification in a background thread so it never blocks
+        # core pose extraction or Pegasus analysis.
+
+        def _run_shot_classification(local_video_path: str):
+            """
+            Background task that runs EfficientNetB0+GRU shot classification.
+
+            Any errors are logged but never raised so that they cannot cause the
+            overall video job to fail.
+            """
+            if not settings.SHOT_CLASSIFICATION_ENABLED:
+                logger.info("Shot classification is disabled via settings; skipping.")
+                return
+
+            try:
+                logger.info("Running shot classification for video %s", video_id)
+                model = get_shot_classifier()
+
+                # Use a small, fixed number of frames to keep this lightweight.
+                frame_count = 30
+                class_name, confidence, probs = classify_shot_video(
+                    local_video_path,
+                    model=model,
+                    frame_count=frame_count,
+                    class_labels=SHOT_CLASSES,
+                )
+
+                # Publish shot classification to Redis for WebSocket delivery
+                try:
+                    _publish_video_analysis_sync(
+                        video_id,
+                        {
+                            "type": "shot_classification",
+                            "video_id": video_id,
+                            "data": {
+                                "shot_label": class_name,
+                                "confidence_percent": confidence,
+                                "probabilities": probs.tolist(),
+                                "classes": list(SHOT_CLASSES.keys()),
+                            },
+                            "done": True,
+                        },
+                    )
+                    logger.info(
+                        "Shot classification for video %s: %s (%.2f%%)",
+                        video_id,
+                        class_name,
+                        confidence,
+                    )
+                except Exception as e:
+                    logger.error(
+                        "Failed to publish shot classification for video %s: %s",
+                        video_id,
+                        e,
+                        exc_info=True,
+                    )
+
+            except FileNotFoundError as e:
+                logger.error(
+                    "Shot classifier weights not found for video %s: %s", video_id, e
+                )
+            except Exception as e:
+                logger.error(
+                    "Error running shot classification for video %s: %s",
+                    video_id,
+                    e,
+                    exc_info=True,
+                )
+        
+        # Once we have video_path and the function defined, start the shot classifier thread.
+        try:
+            if video_path:
+                shot_thread = threading.Thread(
+                    target=_run_shot_classification,
+                    args=(video_path,),
+                    name=f"shot-classifier-{video_id}",
+                    daemon=True,
+                )
+                shot_thread.start()
+        except Exception as e:
+            logger.error(
+                "Failed to start shot classification thread for video %s: %s",
+                video_id,
+                e,
+                exc_info=True,
+            )
         
         # Step 4: Extract metadata (duration, fps, width, height)
         logger.info("Extracting video metadata")
@@ -583,17 +678,13 @@ def analyze_video_job(video_id: str):
                     # This detects persons on every frame, but processes them in one GPU call
                     detected_bboxes_batch = person_detector.detect_batch(frames)
                     
-                    # OPTIMIZATION 2: Sequential pose estimation (GPU handles parallelism internally)
-                    # Process all frames in batch sequentially - GPU is already parallelized
-                    pose_results_batch = []
-                    for i, frame_bgr in enumerate(frames):
-                        bboxes = detected_bboxes_batch[i] if i < len(detected_bboxes_batch) else None
-                        results = pose_estimator.infer(
-                            frame_bgr,
-                            person_bboxes=bboxes,
-                            auto_detect=False,
-                        )
-                        pose_results_batch.append(results)
+                    # OPTIMIZATION 2: Use PoseEstimator infer_batch helper to keep
+                    # batched processing in a single call (ready for future true batching).
+                    pose_results_batch = pose_estimator.infer_batch(
+                        frames,
+                        person_bboxes_list=detected_bboxes_batch,
+                        auto_detect=False,
+                    )
 
                     # Process each frame in the batch (optimized - minimal logging)
                     for frame_num, pose_results in zip(frame_nums, pose_results_batch):
@@ -650,16 +741,12 @@ def analyze_video_job(video_id: str):
                 # Batch person detection for remaining frames
                 detected_bboxes_batch = person_detector.detect_batch(frames)
                 
-                # Sequential pose estimation for remaining frames
-                pose_results_batch = []
-                for i, frame_bgr in enumerate(frames):
-                    bboxes = detected_bboxes_batch[i] if i < len(detected_bboxes_batch) else None
-                    results = pose_estimator.infer(
-                        frame_bgr,
-                        person_bboxes=bboxes,
-                        auto_detect=False,
-                    )
-                    pose_results_batch.append(results)
+                # Pose estimation for remaining frames (batched helper)
+                pose_results_batch = pose_estimator.infer_batch(
+                    frames,
+                    person_bboxes_list=detected_bboxes_batch,
+                    auto_detect=False,
+                )
 
                 # Process remaining frames (optimized - minimal logging)
                 for frame_num, pose_results in zip(frame_nums, pose_results_batch):

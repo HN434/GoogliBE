@@ -135,6 +135,23 @@ class VideoWebSocketManager:
             }
         )
 
+    async def send_shot_classification(self, video_id: str, shot_data: dict):
+        """
+        Send shot classification result to client.
+
+        This is kept separate from Pegasus/Bedrock analytics so that
+        classification can be triggered and delivered independently.
+        """
+        await self._send_message(
+            video_id,
+            {
+                "type": "shot_classification",
+                "video_id": video_id,
+                "data": shot_data,
+                "done": True,
+            },
+        )
+
     async def _send_message(self, video_id: str, message: dict):
         """
         Send message to WebSocket connection

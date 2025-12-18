@@ -252,17 +252,18 @@ class PoseEstimator:
         """
         if not frames:
             return []
-        
-        # Process each frame in the batch
-        # Note: mmpose's inference_topdown doesn't natively support batch processing,
-        # but processing in batches allows for better organization and future optimization
-        results_batch = []
-        
+
+        # Safe, version-compatible implementation: just delegate to `infer` per frame.
+        # This keeps all batching decisions (frame grouping, person_bboxes_list) at
+        # the caller level and avoids relying on MMPose multi-image API semantics
+        # that differ across versions.
+        results_batch: List[List[PoseEstimatorResult]] = []
+
         for i, frame_bgr in enumerate(frames):
             bboxes = person_bboxes_list[i] if person_bboxes_list and i < len(person_bboxes_list) else None
             frame_results = self.infer(frame_bgr, person_bboxes=bboxes, auto_detect=auto_detect)
             results_batch.append(frame_results)
-        
+
         return results_batch
 
 

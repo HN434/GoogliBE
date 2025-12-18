@@ -96,6 +96,10 @@ class Settings(BaseSettings):
     SHOT_CLASSIFICATION_ENABLED: bool = False
     SHORT_PITCH_DETECTION_ENABLED: bool = False
     MIN_SHOT_CONFIDENCE: float = 0.6
+    SHOT_CLASSIFIER_WEIGHTS_PATH: str = os.getenv(
+        "SHOT_CLASSIFIER_WEIGHTS_PATH",
+        "model_weights.h5",
+    )
 
     # ===== Metrics Computation =====
     COMPUTE_JOINT_ANGLES: bool = True
