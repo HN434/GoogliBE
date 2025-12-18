@@ -482,7 +482,7 @@ class VideoAnalyticsService:
             "Provide observations in plain, coaching-friendly language. "
             "Use British English (UK) spelling and terminology.\n\n"
             "Important constraints:\n"
-            "- Include a boolean field is_cricket_video to indicate if this is a cricket batting video.\n"
+            "- Include a boolean field is_cricket_video to indicate if this is a cricket sport video or not. If it is not a cricket sport video, set this to false.\n"
             "- Include a confidence value for overall classification that this is cricket (0-1).\n\n"
             "Return a JSON object with this structure:\n"
             "{\n"
