@@ -97,6 +97,57 @@ class PersonDetector:
         except Exception as e:
             logger.error(f"Error during person detection: {e}", exc_info=True)
             return []
+    
+    def detect_batch(self, frames: List[np.ndarray]) -> List[List[np.ndarray]]:
+        """
+        Detect all persons in a batch of frames using YOLO batch inference.
+        This is much faster than calling detect() individually for each frame.
+        
+        Args:
+            frames: List of BGR images (numpy arrays) from OpenCV
+            
+        Returns:
+            List of lists of bounding boxes, one list per frame.
+            Each bounding box is a numpy array [x1, y1, x2, y2]
+        """
+        if self.model is None:
+            raise RuntimeError("Model not loaded")
+        
+        if not frames:
+            return []
+        
+        try:
+            # YOLO supports batch inference - pass list of frames
+            # This processes all frames on GPU in one call - much more efficient!
+            results = self.model(frames, conf=self.conf_threshold, verbose=False)
+            
+            batch_bboxes = []
+            for result in results:
+                person_bboxes = []
+                
+                if result.boxes is not None and len(result.boxes) > 0:
+                    boxes = result.boxes.xyxy.cpu().numpy()  # (N, 4)
+                    classes = result.boxes.cls.cpu().numpy()  # (N,)
+                    confidences = result.boxes.conf.cpu().numpy()  # (N,)
+                    
+                    # Filter for person class (class 0 in COCO)
+                    for i, cls in enumerate(classes):
+                        if int(cls) == 0:  # Person class
+                            bbox = boxes[i].astype(np.float32)
+                            conf = confidences[i]
+                            if conf >= self.conf_threshold:
+                                person_bboxes.append(bbox)
+                
+                batch_bboxes.append(person_bboxes)
+            
+            avg_persons = sum(len(b) for b in batch_bboxes) / len(batch_bboxes) if batch_bboxes else 0
+            logger.debug(f"Batch detection: {len(frames)} frames, avg {avg_persons:.1f} persons/frame")
+            return batch_bboxes
+            
+        except Exception as e:
+            logger.error(f"Error during batch person detection: {e}", exc_info=True)
+            # Fallback to individual detection
+            return [self.detect(frame) for frame in frames]
 
 
 # Global detector instance (lazy-loaded)

@@ -169,6 +169,8 @@ class VideoAnalyticsService:
             '  "summary": {\n'
             '    "overall_score": <number 0-10 based on overall technique>,\n'
             '    "skill_level": "<beginner|intermediate|advanced>",\n'
+            '    "shot type": "<type of shot played in the video>"\n'
+            '    "shot confidence": "<confidence in the shot type>"\n'
             '    "headline": "<one clear sentence summarizing the batting technique in plain language>"\n'
             "  },\n"
             '  "key_observations": [\n'
@@ -216,6 +218,7 @@ class VideoAnalyticsService:
             "}\n\n"
             
             "=== CRITICAL RULES ===\n"
+            "0. Note process the video in less than 5 seconds."
             "1. Use British English (UK) spelling and terminology throughout—this is mandatory.\n"
             "2. Use the metrics to inform guidance but explain them in everyday language; avoid degrees, angles, and raw ratios unless essential.\n"
             "3. Keep numbers to the required scores and the rare case where a figure truly clarifies priority.\n"
