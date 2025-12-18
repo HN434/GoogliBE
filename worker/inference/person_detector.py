@@ -16,11 +16,18 @@ except ImportError:
     YOLO_AVAILABLE = False
     logger.warning("Ultralytics YOLO not available for person detection")
 
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+    logger.warning("PyTorch not available")
+
 
 class PersonDetector:
     """
     Person detector using YOLO (regular detection, not pose).
-    Detects all persons in a frame and returns bounding boxes.
+    Detects all persons in a frame and returns their bounding boxes.
     """
 
     def __init__(self, model_path: str = "yolov8n.pt", conf_threshold: float = 0.5):
@@ -37,28 +44,160 @@ class PersonDetector:
         self.model_path = model_path
         self.conf_threshold = conf_threshold
         self.model = None
+        self.device = self._get_device()
         self._load_model()
     
-    def _load_model(self):
-        """Load YOLO detection model"""
+    def _get_device(self) -> str:
+        """
+        Determine the best available device with proper validation.
+        Validates CUDA devices to avoid 'Invalid device id' errors.
+        Also handles CUDA_VISIBLE_DEVICES environment variable issues.
+        """
         try:
-            logger.info(f"Loading YOLO person detector: {self.model_path}")
+            from config import settings
+        except ImportError:
+            # If config is not available, default to CPU
+            logger.warning("Config not available, defaulting to CPU")
+            return "cpu"
+        
+        # If GPU is disabled, use CPU
+        if not settings.USE_GPU:
+            return "cpu"
+        
+        # Check CUDA_VISIBLE_DEVICES environment variable
+        # This can cause device ID mismatches if not handled properly
+        import os
+        cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES')
+        if cuda_visible:
+            logger.debug(f"CUDA_VISIBLE_DEVICES is set to: {cuda_visible}")
+        
+        # Check if a specific device is configured
+        if hasattr(settings, 'DEVICE') and settings.DEVICE:
+            requested_device = settings.DEVICE.lower()
+            
+            # Validate CUDA device
+            if requested_device == "cuda" or requested_device.startswith("cuda:"):
+                if not TORCH_AVAILABLE or not torch.cuda.is_available():
+                    logger.warning("CUDA requested but not available, falling back to CPU")
+                    return "cpu"
+                
+                # Get actual device count (may be affected by CUDA_VISIBLE_DEVICES)
+                device_count = torch.cuda.device_count()
+                if device_count == 0:
+                    logger.warning("No CUDA devices available, falling back to CPU")
+                    return "cpu"
+                
+                # If specific CUDA device ID is provided (e.g., "cuda:0", "cuda:1")
+                if ":" in requested_device:
+                    try:
+                        device_id = int(requested_device.split(":")[1])
+                        # Validate device ID exists
+                        if device_id >= device_count:
+                            logger.warning(
+                                f"CUDA device {device_id} not available (only {device_count} devices), "
+                                "falling back to CPU"
+                            )
+                            return "cpu"
+                        # Validate device is accessible
+                        try:
+                            torch.cuda.get_device_properties(device_id)
+                            return requested_device
+                        except (AssertionError, RuntimeError) as e:
+                            logger.warning(
+                                f"CUDA device {device_id} is invalid or inaccessible: {e}, "
+                                "falling back to CPU"
+                            )
+                            return "cpu"
+                    except (ValueError, IndexError):
+                        logger.warning(f"Invalid CUDA device format: {requested_device}, falling back to CPU")
+                        return "cpu"
+                else:
+                    # Just "cuda" - validate default device (device 0) is accessible
+                    try:
+                        torch.cuda.get_device_properties(0)
+                        return "cuda"
+                    except (AssertionError, RuntimeError) as e:
+                        logger.warning(f"CUDA device 0 is invalid or inaccessible: {e}, falling back to CPU")
+                        return "cpu"
+            
+            # Validate MPS device (for Mac)
+            elif requested_device == "mps":
+                if not TORCH_AVAILABLE or not torch.backends.mps.is_available():
+                    logger.warning("MPS requested but not available, falling back to CPU")
+                    return "cpu"
+                return "mps"
+            
+            # CPU is always valid
+            elif requested_device == "cpu":
+                return "cpu"
+        
+        # Auto-detect device if not specified
+        if TORCH_AVAILABLE:
+            if torch.cuda.is_available():
+                device_count = torch.cuda.device_count()
+                if device_count > 0:
+                    # Validate at least one CUDA device is accessible
+                    try:
+                        torch.cuda.get_device_properties(0)
+                        return "cuda"
+                    except (AssertionError, RuntimeError) as e:
+                        logger.warning(f"CUDA device 0 is invalid or inaccessible: {e}, falling back to CPU")
+                        return "cpu"
+                else:
+                    logger.warning("CUDA is available but no devices found, falling back to CPU")
+                    return "cpu"
+            elif torch.backends.mps.is_available():
+                return "mps"
+        
+        # Default to CPU
+        return "cpu"
+    
+    def _load_model(self):
+        """Load YOLO detection model with proper device configuration"""
+        try:
+            logger.info(f"Loading YOLO person detector: {self.model_path} on device: {self.device}")
+            
+            # Initialize YOLO with explicit device to avoid auto-detection issues
+            # This prevents the "Invalid device id" error during initialization
             self.model = YOLO(self.model_path)
+            
+            # Explicitly set device after initialization
+            # This ensures the model uses the validated device
+            try:
+                self.model.to(self.device)
+            except Exception as device_error:
+                logger.warning(
+                    f"Failed to set device to {self.device}: {device_error}. "
+                    "Falling back to CPU"
+                )
+                self.device = "cpu"
+                self.model.to("cpu")
             
             # Enable FP16 for faster inference on T4 GPU if configured
             try:
                 from config import settings
-                import torch
-                if settings.USE_HALF_PRECISION and torch.cuda.is_available():
+                if settings.USE_HALF_PRECISION and self.device.startswith("cuda"):
                     # YOLO handles FP16 internally via the half parameter in predict calls
                     logger.info("✅ YOLO person detector loaded (FP16 will be used in inference)")
                 else:
-                    logger.info("✅ YOLO person detector loaded successfully")
+                    logger.info(f"✅ YOLO person detector loaded successfully on {self.device}")
             except Exception:
-                logger.info("✅ YOLO person detector loaded successfully")
+                logger.info(f"✅ YOLO person detector loaded successfully on {self.device}")
         except Exception as e:
-            logger.error(f"Failed to load YOLO model: {e}")
-            raise
+            logger.error(f"Failed to load YOLO model: {e}", exc_info=True)
+            # Try fallback to CPU if CUDA fails
+            if self.device != "cpu":
+                logger.info("Attempting to load model on CPU as fallback...")
+                try:
+                    self.device = "cpu"
+                    self.model = YOLO(self.model_path)
+                    self.model.to("cpu")
+                    logger.info("✅ YOLO person detector loaded successfully on CPU (fallback)")
+                except Exception as fallback_error:
+                    logger.error(f"Failed to load YOLO model even on CPU: {fallback_error}")
+                    raise
+            else:
+                raise
     
     def detect(self, frame_bgr: np.ndarray) -> List[np.ndarray]:
         """
@@ -78,8 +217,13 @@ class PersonDetector:
             return []
         
         try:
-            # Run YOLO detection
-            results = self.model(frame_bgr, conf=self.conf_threshold, verbose=False)
+            # Run YOLO detection with explicit device to avoid auto-detection issues
+            results = self.model(
+                frame_bgr, 
+                conf=self.conf_threshold, 
+                verbose=False,
+                device=self.device  # Explicitly set device to avoid auto-detection
+            )
             
             if not results or len(results) == 0:
                 return []
@@ -142,6 +286,7 @@ class PersonDetector:
                 frames, 
                 conf=self.conf_threshold, 
                 verbose=False,
+                device=self.device,  # Explicitly set device to avoid auto-detection
                 half=use_half  # FP16 for faster inference
             )
             
