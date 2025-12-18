@@ -614,23 +614,32 @@ def analyze_video_job(video_id: str):
         # Step 6: Run pose model (RTMPose) in batches
         logger.info("Running RTMPose over video frames in batches")
         
-        batch_size = settings.BATCH_SIZE or 24
+        # Use a small warmup batch (size=1) for the very first inference to
+        # reduce perceived latency, then switch to the configured batch size
+        main_batch_size = settings.BATCH_SIZE or 24
         
         frames_results = []
         processed_frames = 0
         total_persons = 0
 
         try:
-            for batch in video_processor.get_batch_frames(batch_size=batch_size, sample_rate=None):
-                # Extract frame numbers and frames from batch
-                frame_nums = [fn for fn, _ in batch]
-                frames = [f for _, f in batch]
-                
-                # Batch pose detection
-                pose_results_batch = pose_estimator.infer_batch(frames, auto_detect=True)
-                
-                # Process each frame in the batch
-                for frame_num, pose_results in zip(frame_nums, pose_results_batch):
+            # Frame generator over the whole video (no additional sampling here)
+            frame_iter = video_processor.frame_generator(sample_rate=None)
+
+            # ----- Warmup: run inference on a single frame -----
+            warmup_item = next(frame_iter, None)
+            if warmup_item is not None:
+                warmup_frame_num, warmup_frame = warmup_item
+                warmup_frames = [warmup_frame]
+                warmup_frame_nums = [warmup_frame_num]
+
+                warmup_results_batch = pose_estimator.infer_batch(
+                    warmup_frames,
+                    auto_detect=True,
+                )
+
+                # Process warmup results (same logic as main loop)
+                for frame_num, pose_results in zip(warmup_frame_nums, warmup_results_batch):
                     # Log basic summary
                     if pose_results:
                         avg_conf = float(
@@ -653,7 +662,7 @@ def analyze_video_job(video_id: str):
                             )
                     else:
                         logger.info("Frame %d -> no detections", frame_num)
-                    
+
                     # Build per-frame JSON structure
                     frame_data = {
                         "frame_number": frame_num,
@@ -662,7 +671,7 @@ def analyze_video_job(video_id: str):
                         "num_bats": 0,  # Bat detection disabled
                         "bats": [],
                     }
-                    
+
                     # Add person data
                     for i, result in enumerate(pose_results):
                         person_data = {
@@ -673,19 +682,157 @@ def analyze_video_job(video_id: str):
                             "mean_confidence": float(result.mean_confidence),
                         }
                         frame_data["persons"].append(person_data)
-                    
+
                     frames_results.append(frame_data)
-                    
+
                     total_persons += len(pose_results)
                     processed_frames += 1
-                
-                # Progress update after each batch
+
+                # Progress update after warmup frame
                 if total_frames:
                     progress = 30 + int(25 * processed_frames / max(total_frames, 1))
                     update_video_progress(video_id, min(progress, 55))
-                
+
                 logger.info(
-                    f"Processed batch: {len(batch)} frames, total processed: {processed_frames}/{total_frames or 'unknown'}"
+                    f"Processed warmup batch: 1 frame, total processed: {processed_frames}/{total_frames or 'unknown'}"
+                )
+
+            # ----- Main loop: use configured batch size for remaining frames -----
+            batch: list = []
+            for frame_num, frame in frame_iter:
+                batch.append((frame_num, frame))
+
+                if len(batch) >= main_batch_size:
+                    frame_nums = [fn for fn, _ in batch]
+                    frames = [f for _, f in batch]
+
+                    pose_results_batch = pose_estimator.infer_batch(
+                        frames,
+                        auto_detect=True,
+                    )
+
+                    # Process each frame in the batch
+                    for frame_num, pose_results in zip(frame_nums, pose_results_batch):
+                        # Log basic summary
+                        if pose_results:
+                            avg_conf = float(
+                                sum(r.mean_confidence for r in pose_results) / len(pose_results)
+                            )
+                            num_persons = len(pose_results)
+                            if num_persons > 1:
+                                logger.info(
+                                    "Frame %d -> %d persons detected (multi-person) | mean conf=%.3f",
+                                    frame_num,
+                                    num_persons,
+                                    avg_conf,
+                                )
+                            else:
+                                logger.info(
+                                    "Frame %d -> %d person | mean conf=%.3f",
+                                    frame_num,
+                                    num_persons,
+                                    avg_conf,
+                                )
+                        else:
+                            logger.info("Frame %d -> no detections", frame_num)
+
+                        # Build per-frame JSON structure
+                        frame_data = {
+                            "frame_number": frame_num,
+                            "num_persons": len(pose_results),
+                            "persons": [],
+                            "num_bats": 0,  # Bat detection disabled
+                            "bats": [],
+                        }
+
+                        # Add person data
+                        for i, result in enumerate(pose_results):
+                            person_data = {
+                                "person_id": i,
+                                "keypoints": result.keypoints.tolist(),
+                                "scores": result.scores.tolist(),
+                                "bbox": result.bbox,
+                                "mean_confidence": float(result.mean_confidence),
+                            }
+                            frame_data["persons"].append(person_data)
+
+                        frames_results.append(frame_data)
+
+                        total_persons += len(pose_results)
+                        processed_frames += 1
+
+                    # Progress update after each batch
+                    if total_frames:
+                        progress = 30 + int(25 * processed_frames / max(total_frames, 1))
+                        update_video_progress(video_id, min(progress, 55))
+
+                    logger.info(
+                        f"Processed batch: {len(batch)} frames, total processed: {processed_frames}/{total_frames or 'unknown'}"
+                    )
+
+                    batch = []
+
+            # Process any remaining frames that didn't fill a full batch
+            if batch:
+                frame_nums = [fn for fn, _ in batch]
+                frames = [f for _, f in batch]
+
+                pose_results_batch = pose_estimator.infer_batch(
+                    frames,
+                    auto_detect=True,
+                )
+
+                for frame_num, pose_results in zip(frame_nums, pose_results_batch):
+                    if pose_results:
+                        avg_conf = float(
+                            sum(r.mean_confidence for r in pose_results) / len(pose_results)
+                        )
+                        num_persons = len(pose_results)
+                        if num_persons > 1:
+                            logger.info(
+                                "Frame %d -> %d persons detected (multi-person) | mean conf=%.3f",
+                                frame_num,
+                                num_persons,
+                                avg_conf,
+                            )
+                        else:
+                            logger.info(
+                                "Frame %d -> %d person | mean conf=%.3f",
+                                frame_num,
+                                num_persons,
+                                avg_conf,
+                            )
+                    else:
+                        logger.info("Frame %d -> no detections", frame_num)
+
+                    frame_data = {
+                        "frame_number": frame_num,
+                        "num_persons": len(pose_results),
+                        "persons": [],
+                        "num_bats": 0,
+                        "bats": [],
+                    }
+
+                    for i, result in enumerate(pose_results):
+                        person_data = {
+                            "person_id": i,
+                            "keypoints": result.keypoints.tolist(),
+                            "scores": result.scores.tolist(),
+                            "bbox": result.bbox,
+                            "mean_confidence": float(result.mean_confidence),
+                        }
+                        frame_data["persons"].append(person_data)
+
+                    frames_results.append(frame_data)
+                    total_persons += len(pose_results)
+                    processed_frames += 1
+
+                if total_frames:
+                    progress = 30 + int(25 * processed_frames / max(total_frames, 1))
+                    update_video_progress(video_id, min(progress, 55))
+
+                logger.info(
+                    f"Processed final batch: {len(batch)} frames, total processed: {processed_frames}/{total_frames or 'unknown'}"
                 )
 
         finally:
@@ -696,6 +843,18 @@ def analyze_video_job(video_id: str):
         keypoints_data = frames_results
 
         update_video_progress(video_id, 55)
+
+        # Publish full keypoints dataset to Redis for WebSocket delivery as soon
+        # as it's ready, before any disk I/O or downstream processing.
+        _publish_video_analysis_sync(
+            video_id,
+            {
+                "type": "keypoints",
+                "video_id": video_id,
+                "data": keypoints_data,
+                "done": True,
+            },
+        )
         
         # Step 7: Save keypoints JSON and binary format
         logger.info("Saving keypoints data")
@@ -743,17 +902,6 @@ def analyze_video_job(video_id: str):
                 video_id,
                 keypoints_jsonb=keypoints_jsonb,
             )
-        
-        # Publish keypoints to Redis for WebSocket delivery
-        _publish_video_analysis_sync(
-            video_id,
-            {
-                "type": "keypoints",
-                "video_id": video_id,
-                "data": keypoints_data,
-                "done": False
-            }
-        )
         
         update_video_progress(video_id, 70)
         
