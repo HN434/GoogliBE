@@ -469,7 +469,6 @@ class VideoAnalyticsService:
         return (
             "Analyze this cricket batting video and provide detailed shot-wise analysis. "
             "Detect all shots in the video and for each shot provide:\n\n"
-            "1. Shot timing (start and end time in seconds)\n"
             "2. Key observations about the batting technique\n"
             "3. Specific suggestions for improvement\n"
             "4. Shot type classification (if identifiable: drive, cut, pull, etc.)\n"
@@ -484,68 +483,64 @@ class VideoAnalyticsService:
             "Use British English (UK) spelling and terminology.\n\n"
             "Important constraints:\n"
             "- Include a boolean field is_cricket_video to indicate if this is a cricket batting video.\n"
-            "- Include confidence per shot (0-1). Only include shots with confidence >= 0.8.\n"
+            "- Include confidence per shot (0-1). Only include shots with confidence >= 0.2.\n"
             "- Include a confidence value for overall classification that this is cricket (0-1).\n\n"
             "Return a JSON object with this structure:\n"
             "{\n"
-            '  "video_id": "' + video_id + '",\n'
             '  "is_cricket_video": <true|false>,\n'
             '  "cricket_confidence": <0-1>,\n'
             '  "total_shots": <number>,\n'
             '  "shots": [\n'
             '    {\n'
-            '      "shot_number": <1-indexed>,\n'
-            '      "start_time": <seconds>,\n'
-            '      "end_time": <seconds>,\n'
+            '      "shot_number": <1-indexed>,\n
             '      "shot_type": "<type or null>",\n'
             '      "confidence": <0-1>,\n'
-            '      "observations": ["<observation 1>", "<observation 2>", ...],\n'
-            '      "suggestions": ["<suggestion 1>", "<suggestion 2>", ...]\n'
             '    }\n'
             '  ],\n'
             '  "summary": {\n'
             '    "overall_score": <0-10>,\n'
             '    "skill_level": "<beginner|intermediate|advanced>",\n'
-            '    "headline": "<summary sentence>"\n'
+            '    "headline": "<summary sentence>",\n'
+            '    "shot type": "<type of shot played in the video>"\n'
+            '    "shot confidence": "<confidence in the shot type>"\n'
             '  },\n'
             '  "key_observations": [\n'
             '    {\n'
             '      "title": "Stance and Balance",\n'
             '      "score": <0-10>,\n'
-            '      "description": "<2-3 sentences>"\n'
+            '      "description": "<1-2 sentences>"\n'
             '    },\n'
             '    {\n'
             '      "title": "Backlift and Bat Path",\n'
             '      "score": <0-10>,\n'
-            '      "description": "<2-3 sentences>"\n'
+            '      "description": "<1-2 sentences>"\n'
             '    },\n'
             '    {\n'
             '      "title": "Footwork and Weight Transfer",\n'
             '      "score": <0-10>,\n'
-            '      "description": "<2-3 sentences>"\n'
+            '      "description": "<1-2 sentences>"\n'
             '    },\n'
             '    {\n'
             '      "title": "Swing Path and Follow Through",\n'
             '      "score": <0-10>,\n'
-            '      "description": "<2-3 sentences>"\n'
+            '      "description": "<1-2 sentences>"\n'
             '    }\n'
             '  ],\n'
             '  "improvement_areas": [\n'
             '    {\n'
             '      "title": "<aspect>",\n'
-            '      "detail": "<2-3 sentences>",\n'
+            '      "detail": "<1-2 sentences>",\n'
             '      "priority": "<high|medium|low>"\n'
             '    }\n'
             '  ],\n'
             '  "suggested_drills": [\n'
             '    {\n'
             '      "name": "<drill name>",\n'
-            '      "focus_area": "<bat_control|balance|footwork|alignment|weight_transfer>",\n'
-            '      "description": "<2-3 sentences>"\n'
+            '      "description": "<1-2 sentences>"\n'
             '    }\n'
             '  ],\n'
             '  "explanation": {\n'
-            '    "long_form": "<3-4 sentences>",\n'
+            '    "long_form": "<1-2 sentences>",\n'
             '    "notes": ["<tip 1>", "<tip 2>", "<tip 3>"]\n'
             '  }\n'
             "}\n"
