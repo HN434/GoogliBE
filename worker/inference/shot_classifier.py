@@ -13,9 +13,18 @@ from __future__ import annotations
 import os
 from typing import Dict, Tuple
 
+# Force TensorFlow to use CPU only for shot classification to avoid GPU contention
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
+
+import tensorflow as tf
+
+try:  # Extra safety in case GPUs are still visible for any reason
+    tf.config.set_visible_devices([], "GPU")
+except Exception:
+    pass
+
 import cv2
 import numpy as np
-import tensorflow as tf
 from tensorflow.keras import layers, models
 from tensorflow.keras.applications import EfficientNetB0
 
