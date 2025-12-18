@@ -492,7 +492,7 @@ class VideoAnalyticsService:
             '  "total_shots": <number>,\n'
             '  "shots": [\n'
             '    {\n'
-            '      "shot_number": <1-indexed>,\n
+            '      "shot_number": <1-indexed>,\n'
             '      "shot_type": "<type or null>",\n'
             '      "confidence": <0-1>,\n'
             '    }\n'
