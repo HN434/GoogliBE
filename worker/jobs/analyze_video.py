@@ -550,8 +550,16 @@ def analyze_video_job(video_id: str):
         total_persons = 0
 
         try:
-            # Frame generator over the whole video (no additional sampling here)
-            frame_iter = video_processor.frame_generator(sample_rate=None)
+            # Frame generator with sampling to reduce total frames processed
+            # Sample every 2nd frame to roughly halve the work while keeping ~15 fps
+            sample_rate = 2
+            frame_iter = video_processor.frame_generator(sample_rate=sample_rate)
+
+            # Effective total frames for progress calculations (how many frames we actually process)
+            if total_frames:
+                effective_total_frames = (total_frames + sample_rate - 1) // sample_rate
+            else:
+                effective_total_frames = None
 
             # Get person detector for batch detection
             person_detector = get_person_detector()
@@ -612,14 +620,17 @@ def analyze_video_job(video_id: str):
                         processed_frames += 1
                     
                     # Log only once per batch (not per frame) for performance
-                    if processed_frames % (main_batch_size * 4) == 0 or processed_frames == total_frames:
+                    if processed_frames % (main_batch_size * 4) == 0 or (
+                        effective_total_frames and processed_frames >= effective_total_frames
+                    ):
                         logger.info(
-                            f"Processed {processed_frames}/{total_frames or 'unknown'} frames, {total_persons} total persons detected"
+                            f"Processed {processed_frames}/{effective_total_frames or 'unknown'} sampled frames, "
+                            f"{total_persons} total persons detected"
                         )
 
                     # Progress update less frequently (every 2 batches) to reduce overhead
-                    if total_frames and processed_frames % (main_batch_size * 2) == 0:
-                        progress = 30 + int(25 * processed_frames / max(total_frames, 1))
+                    if effective_total_frames and processed_frames % (main_batch_size * 2) == 0:
+                        progress = 30 + int(25 * processed_frames / max(effective_total_frames, 1))
                         update_video_progress(video_id, min(progress, 55))
 
                     # Clear GPU cache periodically to prevent memory fragmentation
@@ -673,8 +684,8 @@ def analyze_video_job(video_id: str):
                     total_persons += len(pose_results)
                     processed_frames += 1
 
-                if total_frames:
-                    progress = 30 + int(25 * processed_frames / max(total_frames, 1))
+                if effective_total_frames:
+                    progress = 30 + int(25 * processed_frames / max(effective_total_frames, 1))
                     update_video_progress(video_id, min(progress, 55))
 
         finally:
