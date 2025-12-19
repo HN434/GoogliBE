@@ -126,7 +126,13 @@ class PoseEstimator:
                     logger.info("RTMPose model compiled with torch.compile")
             except Exception as e:
                 logger.debug(f"Could not compile model (this is optional): {e}")
-                
+            
+            # Ensure we are in eval mode for inference (no dropout/BN updates)
+            try:
+                self.model.eval()
+            except Exception as e:
+                logger.debug(f"Could not set model to eval mode (safe to ignore): {e}")
+
         finally:
             # Restore original torch.load
             torch.load = original_torch_load
@@ -193,12 +199,19 @@ class PoseEstimator:
 
         # Call inference_topdown - it expects bboxes as numpy array with shape (N, 4)
         # bbox_format='xyxy' means [x1, y1, x2, y2] format
-        pose_data_samples: List[PoseDataSample] = inference_topdown(
-            self.model,
-            frame_bgr,
-            bboxes=bboxes_np,
-            bbox_format='xyxy',
-        )
+        # Use inference_mode/no_grad to disable autograd and speed up inference
+        try:
+            inference_ctx = torch.inference_mode
+        except AttributeError:  # Older PyTorch
+            inference_ctx = torch.no_grad
+
+        with inference_ctx():
+            pose_data_samples: List[PoseDataSample] = inference_topdown(
+                self.model,
+                frame_bgr,
+                bboxes=bboxes_np,
+                bbox_format='xyxy',
+            )
 
         results: List[PoseEstimatorResult] = []
         for sample in pose_data_samples:
