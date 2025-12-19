@@ -161,6 +161,25 @@ class PersonDetector:
                 self.device = "cpu"
                 self.model.to("cpu")
             
+            # Verify model is on the correct device
+            try:
+                # YOLO model device can be checked via model.device property
+                if hasattr(self.model, 'device'):
+                    actual_device = str(self.model.device)
+                elif hasattr(self.model, 'model') and hasattr(self.model.model, 'device'):
+                    actual_device = str(self.model.model.device)
+                else:
+                    actual_device = self.device  # Fallback to requested device
+                
+                logger.info(f"YOLO person detector device: {actual_device} (requested: {self.device})")
+                
+                if self.device.startswith("cuda") and not actual_device.startswith("cuda"):
+                    logger.warning(f"⚠️ YOLO requested GPU ({self.device}) but model is on {actual_device}")
+                elif self.device.startswith("cuda") and actual_device.startswith("cuda"):
+                    logger.info(f"✅ YOLO confirmed on GPU: {actual_device}")
+            except Exception as e:
+                logger.debug(f"Could not verify YOLO device: {e}")
+            
             # Enable FP16 for faster inference on T4 GPU if configured
             try:
                 from config import settings

@@ -110,11 +110,29 @@ class PoseEstimator:
                 checkpoint=str(checkpoint_path),
                 device=device,
             )
+            
+            # Verify model is on the correct device
+            if hasattr(self.model, 'device'):
+                actual_device = str(self.model.device)
+            elif hasattr(self.model, 'module') and hasattr(self.model.module, 'device'):
+                actual_device = str(self.model.module.device)
+            else:
+                # Try to get device from model parameters
+                try:
+                    first_param = next(self.model.parameters())
+                    actual_device = str(first_param.device)
+                except:
+                    actual_device = "unknown"
+            
+            logger.info(f"RTMPose model successfully loaded on device: {actual_device} (requested: {device})")
+            
+            if device.startswith("cuda") and not actual_device.startswith("cuda"):
+                logger.warning(f"⚠️ RTMPose requested GPU ({device}) but model is on {actual_device}")
+            elif device.startswith("cuda") and actual_device.startswith("cuda"):
+                logger.info(f"✅ RTMPose confirmed on GPU: {actual_device}")
         finally:
             # Restore original torch.load
             torch.load = original_torch_load
-        
-        logger.info("RTMPose model successfully loaded")
 
     def infer(
         self,
@@ -258,7 +276,18 @@ def get_pose_estimator() -> PoseEstimator:
     """
     config_path = Path(settings.RTMPOSE_CONFIG_PATH).expanduser().resolve()
     checkpoint_path = Path(settings.RTMPOSE_CHECKPOINT_PATH).expanduser().resolve()
-    device = settings.DEVICE
+    
+    # Use RTMPOSE_DEVICE if available, otherwise fall back to DEVICE
+    device = getattr(settings, 'RTMPOSE_DEVICE', None) or settings.DEVICE or "cuda"
+    
+    # Ensure device is valid
+    if device and device.startswith("cuda"):
+        import torch
+        if not torch.cuda.is_available():
+            logger.warning("CUDA requested for RTMPose but not available, falling back to CPU")
+            device = "cpu"
+    
+    logger.info(f"Initializing RTMPose with device: {device}")
 
     estimator = PoseEstimator(
         config_path=config_path,
