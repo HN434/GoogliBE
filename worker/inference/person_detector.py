@@ -81,35 +81,10 @@ class PersonDetector:
                     logger.warning("CUDA requested but not available, falling back to CPU")
                     return "cpu"
                 
-                # Get actual device count (may be affected by CUDA_VISIBLE_DEVICES)
-                device_count = torch.cuda.device_count()
-                if device_count == 0:
-                    logger.warning("No CUDA devices available, falling back to CPU")
-                    return "cpu"
-                
-                # If specific CUDA device ID is provided (e.g., "cuda:0", "cuda:1")
-                if ":" in requested_device:
-                    try:
-                        device_id = int(requested_device.split(":")[1])
-                        # Validate device ID exists
-                        if device_id >= device_count:
-                            logger.warning(
-                                f"CUDA device {device_id} not available (only {device_count} devices), "
-                                "falling back to CPU"
-                            )
-                            return "cpu"
-                        # Device ID is within valid range, return it
-                        # Don't validate with get_device_properties as it can cause the same error
-                        # YOLO will handle device selection when we call model.to(device)
-                        return requested_device
-                    except (ValueError, IndexError):
-                        logger.warning(f"Invalid CUDA device format: {requested_device}, falling back to CPU")
-                        return "cpu"
-                else:
-                    # Just "cuda" - don't validate, just return it
-                    # torch.cuda.is_available() and device_count > 0 are sufficient
-                    # Validating with get_device_properties can cause the same error we're trying to avoid
-                    return "cuda"
+                # Don't check device_count - it can be misleading (CUDA_VISIBLE_DEVICES can affect it)
+                # If torch.cuda.is_available() is True, trust it and let YOLO handle device selection
+                # RTMPose can use CUDA, so YOLO should be able to as well
+                return requested_device
             
             # Validate MPS device (for Mac)
             elif requested_device == "mps":
@@ -126,14 +101,9 @@ class PersonDetector:
         # Use simple checks - don't validate with get_device_properties as it can cause errors
         if TORCH_AVAILABLE:
             if torch.cuda.is_available():
-                device_count = torch.cuda.device_count()
-                if device_count > 0:
-                    # CUDA is available and devices exist - return "cuda"
-                    # Don't validate with get_device_properties - it can trigger the same error
-                    return "cuda"
-                else:
-                    logger.warning("CUDA is available but no devices found, falling back to CPU")
-                    return "cpu"
+                # If CUDA is available, use it - don't check device_count as it can be misleading
+                # RTMPose can use CUDA, so YOLO should be able to as well
+                return "cuda"
             elif torch.backends.mps.is_available():
                 return "mps"
         
