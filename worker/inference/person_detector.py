@@ -4,10 +4,15 @@ Detects all persons in a frame and returns their bounding boxes for pose estimat
 """
 
 import logging
+import os
 from typing import List, Optional
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+# Save original CUDA_VISIBLE_DEVICES before shot_classifier potentially changes it
+# This allows YOLO to use GPU even if shot_classifier sets CUDA_VISIBLE_DEVICES=-1
+_ORIGINAL_CUDA_VISIBLE_DEVICES = os.environ.get("CUDA_VISIBLE_DEVICES")
 
 try:
     from ultralytics import YOLO
@@ -48,16 +53,22 @@ class PersonDetector:
         
         # Normalize device for YOLO when CUDA_VISIBLE_DEVICES is set
         # YOLO's device selection gets confused with device IDs when CUDA_VISIBLE_DEVICES is set
-        import os
-        if self.device.startswith("cuda"):
-            cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES')
-            if cuda_visible is not None:
-                # When CUDA_VISIBLE_DEVICES is set, use "cuda" instead of "cuda:0"
-                # YOLO will auto-select the visible device
-                self.yolo_device = "cuda"
-                logger.info(f"CUDA_VISIBLE_DEVICES={cuda_visible} detected, using device='cuda' for YOLO")
-            else:
-                self.yolo_device = self.device
+        cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES')
+        
+        # If CUDA_VISIBLE_DEVICES was set to -1 (by shot_classifier), unset it for YOLO
+        # shot_classifier should use tf.config instead of CUDA_VISIBLE_DEVICES
+        if cuda_visible == "-1" and self.device.startswith("cuda"):
+            logger.warning("CUDA_VISIBLE_DEVICES=-1 detected (likely from shot_classifier), unsetting for YOLO GPU access")
+            # Unset it so YOLO can use GPU
+            if "CUDA_VISIBLE_DEVICES" in os.environ:
+                del os.environ["CUDA_VISIBLE_DEVICES"]
+            cuda_visible = None
+        
+        if self.device.startswith("cuda") and cuda_visible is not None and cuda_visible != "-1":
+            # When CUDA_VISIBLE_DEVICES is set to a valid device, use "cuda" instead of "cuda:0"
+            # YOLO will auto-select the visible device
+            self.yolo_device = "cuda"
+            logger.info(f"CUDA_VISIBLE_DEVICES={cuda_visible} detected, using device='cuda' for YOLO")
         else:
             self.yolo_device = self.device
         
@@ -138,13 +149,13 @@ class PersonDetector:
             # Enable FP16 for faster inference on T4 GPU if configured
             try:
                 from config import settings
-                if settings.USE_HALF_PRECISION and self.device.startswith("cuda"):
+                if settings.USE_HALF_PRECISION and self.yolo_device.startswith("cuda"):
                     # YOLO handles FP16 internally via the half parameter in predict calls
-                    logger.info(f"✅ YOLO person detector loaded (device={yolo_device}, FP16 enabled)")
+                    logger.info(f"✅ YOLO person detector loaded (device={self.yolo_device}, FP16 enabled)")
                 else:
-                    logger.info(f"✅ YOLO person detector loaded successfully (device={yolo_device})")
+                    logger.info(f"✅ YOLO person detector loaded successfully (device={self.yolo_device})")
             except Exception:
-                logger.info(f"✅ YOLO person detector loaded successfully (device={yolo_device})")
+                logger.info(f"✅ YOLO person detector loaded successfully (device={self.yolo_device})")
         except Exception as e:
             logger.error(f"Failed to load YOLO model: {e}", exc_info=True)
             # Try fallback to CPU if CUDA fails

@@ -14,12 +14,16 @@ import os
 from typing import Dict, Tuple
 
 # Force TensorFlow to use CPU only for shot classification to avoid GPU contention
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
-
+# Don't set CUDA_VISIBLE_DEVICES globally - it affects PyTorch models too!
+# Instead, configure TensorFlow directly to not use GPU
 import tensorflow as tf
 
-try:  # Extra safety in case GPUs are still visible for any reason
+# Configure TensorFlow to use CPU only (without affecting PyTorch)
+try:
+    # Hide GPUs from TensorFlow
     tf.config.set_visible_devices([], "GPU")
+    logger = __import__('logging').getLogger(__name__)
+    logger.debug("TensorFlow configured to use CPU only (PyTorch GPU access preserved)")
 except Exception:
     pass
 
