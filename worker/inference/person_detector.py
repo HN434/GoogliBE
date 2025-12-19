@@ -45,6 +45,22 @@ class PersonDetector:
         self.conf_threshold = conf_threshold
         self.model = None
         self.device = self._get_device()
+        
+        # Normalize device for YOLO when CUDA_VISIBLE_DEVICES is set
+        # YOLO's device selection gets confused with device IDs when CUDA_VISIBLE_DEVICES is set
+        import os
+        if self.device.startswith("cuda"):
+            cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES')
+            if cuda_visible is not None:
+                # When CUDA_VISIBLE_DEVICES is set, use "cuda" instead of "cuda:0"
+                # YOLO will auto-select the visible device
+                self.yolo_device = "cuda"
+                logger.info(f"CUDA_VISIBLE_DEVICES={cuda_visible} detected, using device='cuda' for YOLO")
+            else:
+                self.yolo_device = self.device
+        else:
+            self.yolo_device = self.device
+        
         self._load_model()
     
     def _get_device(self) -> str:
@@ -113,53 +129,22 @@ class PersonDetector:
     def _load_model(self):
         """Load YOLO detection model with proper device configuration"""
         try:
-            logger.info(f"Loading YOLO person detector: {self.model_path} on device: {self.device}")
+            logger.info(f"Loading YOLO person detector: {self.model_path} on device: {self.yolo_device} (original: {self.device})")
             
-            # Initialize YOLO with explicit device to avoid auto-detection issues
-            # This prevents the "Invalid device id" error during initialization
+            # Initialize YOLO - don't set device here, let it be set in predict calls
+            # This avoids device ID conflicts with CUDA_VISIBLE_DEVICES
             self.model = YOLO(self.model_path)
-            
-            # Explicitly set device after initialization
-            # This ensures the model uses the validated device
-            try:
-                self.model.to(self.device)
-            except Exception as device_error:
-                logger.warning(
-                    f"Failed to set device to {self.device}: {device_error}. "
-                    "Falling back to CPU"
-                )
-                self.device = "cpu"
-                self.model.to("cpu")
-            
-            # Verify model is on the correct device
-            try:
-                # YOLO model device can be checked via model.device property
-                if hasattr(self.model, 'device'):
-                    actual_device = str(self.model.device)
-                elif hasattr(self.model, 'model') and hasattr(self.model.model, 'device'):
-                    actual_device = str(self.model.model.device)
-                else:
-                    actual_device = self.device  # Fallback to requested device
-                
-                logger.info(f"YOLO person detector device: {actual_device} (requested: {self.device})")
-                
-                if self.device.startswith("cuda") and not actual_device.startswith("cuda"):
-                    logger.warning(f"⚠️ YOLO requested GPU ({self.device}) but model is on {actual_device}")
-                elif self.device.startswith("cuda") and actual_device.startswith("cuda"):
-                    logger.info(f"✅ YOLO confirmed on GPU: {actual_device}")
-            except Exception as e:
-                logger.debug(f"Could not verify YOLO device: {e}")
             
             # Enable FP16 for faster inference on T4 GPU if configured
             try:
                 from config import settings
                 if settings.USE_HALF_PRECISION and self.device.startswith("cuda"):
                     # YOLO handles FP16 internally via the half parameter in predict calls
-                    logger.info("✅ YOLO person detector loaded (FP16 will be used in inference)")
+                    logger.info(f"✅ YOLO person detector loaded (device={yolo_device}, FP16 enabled)")
                 else:
-                    logger.info(f"✅ YOLO person detector loaded successfully on {self.device}")
+                    logger.info(f"✅ YOLO person detector loaded successfully (device={yolo_device})")
             except Exception:
-                logger.info(f"✅ YOLO person detector loaded successfully on {self.device}")
+                logger.info(f"✅ YOLO person detector loaded successfully (device={yolo_device})")
         except Exception as e:
             logger.error(f"Failed to load YOLO model: {e}", exc_info=True)
             # Try fallback to CPU if CUDA fails
@@ -194,12 +179,12 @@ class PersonDetector:
             return []
         
         try:
-            # Run YOLO detection with explicit device to avoid auto-detection issues
+            # Run YOLO detection with normalized device (handles CUDA_VISIBLE_DEVICES)
             results = self.model(
                 frame_bgr, 
                 conf=self.conf_threshold, 
                 verbose=False,
-                device=self.device  # Explicitly set device to avoid auto-detection
+                device=self.yolo_device  # Use normalized device (cuda instead of cuda:0 when CUDA_VISIBLE_DEVICES is set)
             )
             
             if not results or len(results) == 0:
@@ -263,7 +248,7 @@ class PersonDetector:
                 frames, 
                 conf=self.conf_threshold, 
                 verbose=False,
-                device=self.device,  # Explicitly set device to avoid auto-detection
+                device=self.yolo_device,  # Use normalized device (handles CUDA_VISIBLE_DEVICES)
                 half=use_half  # FP16 for faster inference
             )
             

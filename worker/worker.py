@@ -23,7 +23,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-async def main(num_workers: int = 2):
+async def main(num_workers: int = 1):
     """Main worker entry point (ARQ async worker)
 
     Args:
@@ -159,7 +159,7 @@ if __name__ == "__main__":
     # Usage:
     #   python -m worker.worker           # starts 2 workers (default)
     #   python -m worker.worker 3         # starts 3 workers
-    default_workers = 2
+    default_workers = 1
     num_workers = default_workers
     if len(sys.argv) > 1:
         try:
