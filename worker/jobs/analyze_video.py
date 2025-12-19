@@ -633,148 +633,78 @@ def analyze_video_job(video_id: str):
         # Step 6: Run pose model (RTMPose) in batches
         logger.info("Running RTMPose over video frames in batches")
         
-        # Use a small warmup batch (size=1) for the very first inference to
-        # reduce perceived latency, then switch to the configured batch size
-        main_batch_size = settings.BATCH_SIZE or 24
-        
-        # Import for batch person detection
-        from worker.inference.person_detector import get_person_detector
+        batch_size = settings.BATCH_SIZE or 16
         
         frames_results = []
         processed_frames = 0
         total_persons = 0
-
         try:
-            # Frame generator with sampling to reduce total frames processed
-            # Sample every 2nd frame to roughly halve the work while keeping ~15 fps
-            sample_rate = 2
-            frame_iter = video_processor.frame_generator(sample_rate=sample_rate)
-
-            # Effective total frames for progress calculations (how many frames we actually process)
-            if total_frames:
-                effective_total_frames = (total_frames + sample_rate - 1) // sample_rate
-            else:
-                effective_total_frames = None
-
-            # Get person detector for batch detection
-            person_detector = get_person_detector()
-
-            # Skip warmup - start processing immediately with full batches for better GPU utilization
-
-            # ----- Main loop: use configured batch size for remaining frames -----
-            batch: list = []
-            
-            # Process frames sequentially - GPU operations are synchronous and don't benefit from threading
-            # ThreadPoolExecutor adds overhead for GPU-bound tasks
-            
-            for frame_num, frame in frame_iter:
-                batch.append((frame_num, frame))
-
-                if len(batch) >= main_batch_size:
-                    frame_nums = [fn for fn, _ in batch]
-                    frames = [f for _, f in batch]
-
-                    # OPTIMIZATION 1: Batch person detection (all frames at once on GPU)
-                    # This detects persons on every frame, but processes them in one GPU call
-                    detected_bboxes_batch = person_detector.detect_batch(frames)
-                    
-                    # OPTIMIZATION 2: Use PoseEstimator infer_batch helper to keep
-                    # batched processing in a single call (ready for future true batching).
-                    pose_results_batch = pose_estimator.infer_batch(
-                        frames,
-                        person_bboxes_list=detected_bboxes_batch,
-                        auto_detect=False,
-                    )
-
-                    # Process each frame in the batch (optimized - minimal logging)
-                    for frame_num, pose_results in zip(frame_nums, pose_results_batch):
-                        # Build per-frame JSON structure (optimized)
-                        frame_data = {
-                            "frame_number": frame_num,
-                            "num_persons": len(pose_results),
-                            "persons": [
-                                {
-                                    "person_id": i,
-                                    "keypoints": result.keypoints.tolist(),
-                                    "scores": result.scores.tolist(),
-                                    "bbox": result.bbox,
-                                    "mean_confidence": float(result.mean_confidence),
-                                }
-                                for i, result in enumerate(pose_results)
-                            ],
-                            "num_bats": 0,
-                            "bats": [],
-                        }
-
-                        frames_results.append(frame_data)
-                        total_persons += len(pose_results)
-                        processed_frames += 1
-                    
-                    # Log only once per batch (not per frame) for performance
-                    if processed_frames % (main_batch_size * 4) == 0 or (
-                        effective_total_frames and processed_frames >= effective_total_frames
-                    ):
-                        logger.info(
-                            f"Processed {processed_frames}/{effective_total_frames or 'unknown'} sampled frames, "
-                            f"{total_persons} total persons detected"
-                        )
-
-                    # Progress update less frequently (every 2 batches) to reduce overhead
-                    if effective_total_frames and processed_frames % (main_batch_size * 2) == 0:
-                        progress = 30 + int(25 * processed_frames / max(effective_total_frames, 1))
-                        update_video_progress(video_id, min(progress, 55))
-
-                    # Clear GPU cache periodically to prevent memory fragmentation
-                    if settings.CLEAR_GPU_CACHE and processed_frames % (main_batch_size * 2) == 0:
-                        import torch
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                            logger.debug("Cleared GPU cache")
-
-                    batch = []
-
-            # Process any remaining frames that didn't fill a full batch
-            if batch:
+            for batch in video_processor.get_batch_frames(batch_size=batch_size, sample_rate=None):
+                # Extract frame numbers and frames from batch
                 frame_nums = [fn for fn, _ in batch]
                 frames = [f for _, f in batch]
-
-                # Batch person detection for remaining frames
-                detected_bboxes_batch = person_detector.detect_batch(frames)
                 
-                # Pose estimation for remaining frames (batched helper)
-                pose_results_batch = pose_estimator.infer_batch(
-                    frames,
-                    person_bboxes_list=detected_bboxes_batch,
-                    auto_detect=False,
-                )
-
-                # Process remaining frames (optimized - minimal logging)
+                # Batch pose detection
+                pose_results_batch = pose_estimator.infer_batch(frames, auto_detect=True)
+                
+                # Process each frame in the batch
                 for frame_num, pose_results in zip(frame_nums, pose_results_batch):
+                    # Log basic summary
+                    if pose_results:
+                        avg_conf = float(
+                            sum(r.mean_confidence for r in pose_results) / len(pose_results)
+                        )
+                        num_persons = len(pose_results)
+                        if num_persons > 1:
+                            logger.info(
+                                "Frame %d -> %d persons detected (multi-person) | mean conf=%.3f",
+                                frame_num,
+                                num_persons,
+                                avg_conf,
+                            )
+                        else:
+                            logger.info(
+                                "Frame %d -> %d person | mean conf=%.3f",
+                                frame_num,
+                                num_persons,
+                                avg_conf,
+                            )
+                    else:
+                        logger.info("Frame %d -> no detections", frame_num)
+                    
+                    # Build per-frame JSON structure
                     frame_data = {
                         "frame_number": frame_num,
                         "num_persons": len(pose_results),
-                        "persons": [
-                            {
-                                "person_id": i,
-                                "keypoints": result.keypoints.tolist(),
-                                "scores": result.scores.tolist(),
-                                "bbox": result.bbox,
-                                "mean_confidence": float(result.mean_confidence),
-                            }
-                            for i, result in enumerate(pose_results)
-                        ],
-                        "num_bats": 0,
+                        "persons": [],
+                        "num_bats": 0,  # Bat detection disabled
                         "bats": [],
                     }
-
+                    
+                    # Add person data
+                    for i, result in enumerate(pose_results):
+                        person_data = {
+                            "person_id": i,
+                            "keypoints": result.keypoints.tolist(),
+                            "scores": result.scores.tolist(),
+                            "bbox": result.bbox,
+                            "mean_confidence": float(result.mean_confidence),
+                        }
+                        frame_data["persons"].append(person_data)
+                    
                     frames_results.append(frame_data)
+                    
                     total_persons += len(pose_results)
                     processed_frames += 1
-
-                if effective_total_frames:
-                    progress = 30 + int(25 * processed_frames / max(effective_total_frames, 1))
+                
+                # Progress update after each batch
+                if total_frames:
+                    progress = 30 + int(25 * processed_frames / max(total_frames, 1))
                     update_video_progress(video_id, min(progress, 55))
-
+                
+                logger.info(
+                    f"Processed batch: {len(batch)} frames, total processed: {processed_frames}/{total_frames or 'unknown'}"
+                )
         finally:
             video_processor.cleanup()
 
