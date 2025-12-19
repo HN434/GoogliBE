@@ -98,27 +98,18 @@ class PersonDetector:
                                 "falling back to CPU"
                             )
                             return "cpu"
-                        # Validate device is accessible
-                        try:
-                            torch.cuda.get_device_properties(device_id)
-                            return requested_device
-                        except (AssertionError, RuntimeError) as e:
-                            logger.warning(
-                                f"CUDA device {device_id} is invalid or inaccessible: {e}, "
-                                "falling back to CPU"
-                            )
-                            return "cpu"
+                        # Device ID is within valid range, return it
+                        # Don't validate with get_device_properties as it can cause the same error
+                        # YOLO will handle device selection when we call model.to(device)
+                        return requested_device
                     except (ValueError, IndexError):
                         logger.warning(f"Invalid CUDA device format: {requested_device}, falling back to CPU")
                         return "cpu"
                 else:
-                    # Just "cuda" - validate default device (device 0) is accessible
-                    try:
-                        torch.cuda.get_device_properties(0)
-                        return "cuda"
-                    except (AssertionError, RuntimeError) as e:
-                        logger.warning(f"CUDA device 0 is invalid or inaccessible: {e}, falling back to CPU")
-                        return "cpu"
+                    # Just "cuda" - don't validate, just return it
+                    # torch.cuda.is_available() and device_count > 0 are sufficient
+                    # Validating with get_device_properties can cause the same error we're trying to avoid
+                    return "cuda"
             
             # Validate MPS device (for Mac)
             elif requested_device == "mps":
@@ -132,17 +123,14 @@ class PersonDetector:
                 return "cpu"
         
         # Auto-detect device if not specified
+        # Use simple checks - don't validate with get_device_properties as it can cause errors
         if TORCH_AVAILABLE:
             if torch.cuda.is_available():
                 device_count = torch.cuda.device_count()
                 if device_count > 0:
-                    # Validate at least one CUDA device is accessible
-                    try:
-                        torch.cuda.get_device_properties(0)
-                        return "cuda"
-                    except (AssertionError, RuntimeError) as e:
-                        logger.warning(f"CUDA device 0 is invalid or inaccessible: {e}, falling back to CPU")
-                        return "cpu"
+                    # CUDA is available and devices exist - return "cuda"
+                    # Don't validate with get_device_properties - it can trigger the same error
+                    return "cuda"
                 else:
                     logger.warning("CUDA is available but no devices found, falling back to CPU")
                     return "cpu"
