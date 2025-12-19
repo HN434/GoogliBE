@@ -158,9 +158,14 @@ class VideoProcessor:
                 yield batch
                 batch = []
 
-        # Yield remaining frames
+        # Yield remaining frames (but cap at batch_size to avoid huge batches)
         if batch:
-            yield batch
+            # If remaining batch is too large, split it
+            while len(batch) > batch_size:
+                yield batch[:batch_size]
+                batch = batch[batch_size:]
+            if batch:
+                yield batch
 
     def get_frame_at_time(self, time_seconds: float) -> Optional[np.ndarray]:
         """

@@ -247,7 +247,7 @@ class PoseEstimator:
                 # Batch person detection for all frames at once (much faster!)
                 person_bboxes_list = detector.detect_batch(frames)
                 detect_time = time.time() - detect_start
-                logger.debug(f"Batch person detection: {len(frames)} frames in {detect_time:.2f}s")
+                logger.info(f"Batch person detection: {len(frames)} frames in {detect_time:.2f}s")
             except Exception as e:
                 logger.warning(f"Batch person detection failed, falling back to per-frame: {e}")
                 person_bboxes_list = None
@@ -264,7 +264,7 @@ class PoseEstimator:
             results_batch.append(frame_results)
         
         pose_time = time.time() - pose_start
-        logger.debug(f"Pose inference: {len(frames)} frames in {pose_time:.2f}s")
+        logger.info(f"Pose inference loop: {len(frames)} frames in {pose_time:.2f}s ({pose_time/len(frames)*1000:.1f}ms per frame)")
         
         return results_batch
 

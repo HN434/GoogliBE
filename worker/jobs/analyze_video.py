@@ -620,6 +620,7 @@ def analyze_video_job(video_id: str):
         start_time = time.time()
         
         batch_size = settings.BATCH_SIZE or 16
+        logger.info(f"Using batch_size={batch_size} for pose inference")
         
         frames_results = []
         processed_frames = 0
@@ -628,7 +629,8 @@ def analyze_video_job(video_id: str):
             batch_start_time = time.time()
             for batch_idx, batch in enumerate(video_processor.get_batch_frames(batch_size=batch_size, sample_rate=None)):
                 batch_load_time = time.time() - batch_start_time
-                logger.info(f"Batch {batch_idx}: Loaded {len(batch)} frames in {batch_load_time:.2f}s")
+                logger.info(f"Batch {batch_idx}: Loaded {len(batch)} frames in {batch_load_time:.2f}s (expected batch_size={batch_size})")
+                batch_start_time = time.time()  # Reset for next batch
                 
                 # Extract frame numbers and frames from batch
                 frame_nums = [fn for fn, _ in batch]
