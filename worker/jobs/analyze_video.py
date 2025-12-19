@@ -580,23 +580,7 @@ def analyze_video_job(video_id: str):
                     exc_info=True,
                 )
         
-        # Once we have video_path and the function defined, start the shot classifier thread.
-        try:
-            if video_path:
-                shot_thread = threading.Thread(
-                    target=_run_shot_classification,
-                    args=(video_path,),
-                    name=f"shot-classifier-{video_id}",
-                    daemon=True,
-                )
-                shot_thread.start()
-        except Exception as e:
-            logger.error(
-                "Failed to start shot classification thread for video %s: %s",
-                video_id,
-                e,
-                exc_info=True,
-            )
+        # Shot classification will be started AFTER RTMPose completes to avoid I/O contention
         
         # Step 4: Extract metadata (duration, fps, width, height)
         logger.info("Extracting video metadata")
@@ -713,6 +697,26 @@ def analyze_video_job(video_id: str):
         keypoints_data = frames_results
 
         update_video_progress(video_id, 55)
+
+        # Start shot classification AFTER RTMPose completes to avoid I/O contention
+        # Both were reading from the same video file simultaneously, causing disk I/O contention
+        try:
+            if video_path:
+                shot_thread = threading.Thread(
+                    target=_run_shot_classification,
+                    args=(video_path,),
+                    name=f"shot-classifier-{video_id}",
+                    daemon=True,
+                )
+                shot_thread.start()
+                logger.info("Started shot classification thread after RTMPose completion")
+        except Exception as e:
+            logger.error(
+                "Failed to start shot classification thread for video %s: %s",
+                video_id,
+                e,
+                exc_info=True,
+            )
 
         # Publish full keypoints dataset to Redis for WebSocket delivery
         # Use background thread to avoid blocking
