@@ -236,15 +236,35 @@ class PoseEstimator:
         if not frames:
             return []
         
+        import time
+        
+        # If auto_detect is True and no bboxes provided, batch person detection first
+        if auto_detect and not person_bboxes_list:
+            detect_start = time.time()
+            try:
+                from worker.inference.person_detector import get_person_detector
+                detector = get_person_detector()
+                # Batch person detection for all frames at once (much faster!)
+                person_bboxes_list = detector.detect_batch(frames)
+                detect_time = time.time() - detect_start
+                logger.debug(f"Batch person detection: {len(frames)} frames in {detect_time:.2f}s")
+            except Exception as e:
+                logger.warning(f"Batch person detection failed, falling back to per-frame: {e}")
+                person_bboxes_list = None
+        
         # Process each frame in the batch
         # Note: mmpose's inference_topdown doesn't natively support batch processing,
         # but processing in batches allows for better organization and future optimization
         results_batch = []
+        pose_start = time.time()
         
         for i, frame_bgr in enumerate(frames):
             bboxes = person_bboxes_list[i] if person_bboxes_list and i < len(person_bboxes_list) else None
-            frame_results = self.infer(frame_bgr, person_bboxes=bboxes, auto_detect=auto_detect)
+            frame_results = self.infer(frame_bgr, person_bboxes=bboxes, auto_detect=False)  # auto_detect=False since we already detected
             results_batch.append(frame_results)
+        
+        pose_time = time.time() - pose_start
+        logger.debug(f"Pose inference: {len(frames)} frames in {pose_time:.2f}s")
         
         return results_batch
 

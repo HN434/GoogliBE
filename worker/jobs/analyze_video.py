@@ -615,7 +615,9 @@ def analyze_video_job(video_id: str):
         update_video_progress(video_id, 30)
 
         # Step 6: Run pose model (RTMPose) in batches
+        import time
         logger.info("Running RTMPose over video frames in batches")
+        start_time = time.time()
         
         batch_size = settings.BATCH_SIZE or 16
         
@@ -623,13 +625,20 @@ def analyze_video_job(video_id: str):
         processed_frames = 0
         total_persons = 0
         try:
-            for batch in video_processor.get_batch_frames(batch_size=batch_size, sample_rate=None):
+            batch_start_time = time.time()
+            for batch_idx, batch in enumerate(video_processor.get_batch_frames(batch_size=batch_size, sample_rate=None)):
+                batch_load_time = time.time() - batch_start_time
+                logger.info(f"Batch {batch_idx}: Loaded {len(batch)} frames in {batch_load_time:.2f}s")
+                
                 # Extract frame numbers and frames from batch
                 frame_nums = [fn for fn, _ in batch]
                 frames = [f for _, f in batch]
                 
                 # Batch pose detection
+                infer_start = time.time()
                 pose_results_batch = pose_estimator.infer_batch(frames, auto_detect=True)
+                infer_time = time.time() - infer_start
+                logger.info(f"Batch {batch_idx}: Pose inference took {infer_time:.2f}s for {len(frames)} frames")
                 
                 # Process each frame in the batch
                 for frame_num, pose_results in zip(frame_nums, pose_results_batch):
