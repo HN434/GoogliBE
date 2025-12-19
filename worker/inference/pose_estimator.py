@@ -1,7 +1,11 @@
 """
-RTMPose inference utilities for worker processes.
+Fast RTMPose-S batch inference for GPU (Tesla T4 optimized).
 
-Loads RTMPose once and exposes a simple interface for frame-level inference.
+Key ideas:
+- No manual crops
+- No pipeline hacking
+- Batch persons, not frames
+- inference_topdown is the hot path
 """
 
 from __future__ import annotations
@@ -16,285 +20,174 @@ import numpy as np
 import torch
 
 from config import settings
+from mmpose.apis import init_model, inference_topdown
+from mmpose.structures import PoseDataSample
 
 logger = logging.getLogger(__name__)
-
-# Fix for PyTorch 2.6+ weights_only=True default
-# Allow numpy objects in checkpoint loading (RTMPose checkpoints contain numpy arrays)
-try:
-    import numpy.core.multiarray as numpy_multiarray
-    torch.serialization.add_safe_globals([
-        numpy_multiarray._reconstruct,
-        numpy_multiarray.scalar,
-        np.ndarray,
-        np.dtype,
-    ])
-    logger.debug("Added numpy safe globals for PyTorch checkpoint loading")
-except (AttributeError, ImportError):
-    # Fallback: if numpy structure is different, just add ndarray
-    try:
-        torch.serialization.add_safe_globals([np.ndarray, np.dtype])
-        logger.debug("Added basic numpy safe globals for PyTorch checkpoint loading")
-    except Exception as e:
-        logger.warning(f"Could not add numpy safe globals: {e}")
-
-try:
-    from mmpose.apis import inference_topdown, init_model
-    from mmpose.structures import PoseDataSample
-except ImportError as exc:  # pragma: no cover - handled at runtime
-    raise ImportError(
-        "mmpose, mmengine, and mmcv must be installed to use RTMPose inference."
-    ) from exc
 
 
 @dataclass
 class PoseEstimatorResult:
-    """Container for a single pose estimation output."""
-
-    keypoints: np.ndarray  # Shape: [N, 2]
-    scores: np.ndarray  # Shape: [N]
+    keypoints: np.ndarray  # [K, 2]
+    scores: np.ndarray     # [K]
     bbox: List[float]
 
     @property
     def mean_confidence(self) -> float:
-        if self.scores.size == 0:
-            return 0.0
-        return float(np.mean(self.scores))
+        return float(self.scores.mean()) if self.scores.size else 0.0
 
 
 class PoseEstimator:
-    """
-    Thin wrapper around RTMPose.
-
-    Loads the model once and exposes an `infer` method that accepts a single frame.
-    """
-
     def __init__(
         self,
         config_path: Path,
         checkpoint_path: Path,
         device: str = "cuda",
     ):
-        if not config_path.exists():
-            raise FileNotFoundError(f"RTMPose config not found: {config_path}")
-        if not checkpoint_path.exists():
-            raise FileNotFoundError(f"RTMPose checkpoint not found: {checkpoint_path}")
-
-        self.config_path = config_path
-        self.checkpoint_path = checkpoint_path
+        logger.info("Loading RTMPose-S (fast path)")
+        # Store paths and device for introspection/logging
+        self.config_path = Path(config_path)
+        self.checkpoint_path = Path(checkpoint_path)
         self.device = device
 
-        logger.info(
-            "Loading RTMPose model\n  config: %s\n  checkpoint: %s\n  device: %s",
-            config_path,
-            checkpoint_path,
-            device,
+        self.model = init_model(
+            config=str(self.config_path),
+            checkpoint=str(self.checkpoint_path),
+            device=device,
         )
-        
-        # Monkey-patch torch.load to use weights_only=False for PyTorch 2.6+
-        # This is safe for trusted RTMPose checkpoints
-        original_torch_load = torch.load
-        
-        def patched_torch_load(*args, **kwargs):
-            """Patched torch.load that forces weights_only=False for trusted checkpoints."""
-            # Always use weights_only=False for checkpoint loading
-            kwargs['weights_only'] = False
-            return original_torch_load(*args, **kwargs)
-        
-        # Temporarily replace torch.load
-        torch.load = patched_torch_load
-        
-        try:
-            self.model = init_model(
-                config=str(config_path),
-                checkpoint=str(checkpoint_path),
-                device=device,
-            )
-            
-            # Enable FP16 for faster inference on T4 GPU if configured
+
+        self.model.eval()
+
+        # FP16 is safe & recommended on T4
+        if device == "cuda" and settings.USE_HALF_PRECISION:
+            self.model = self.model.half()
+            logger.info("RTMPose running in FP16")
+
+        # torch.compile gives ~10% on T4 if overhead is low
+        if device == "cuda" and hasattr(torch, "compile"):
             try:
-                if settings.USE_HALF_PRECISION and device == "cuda":
-                    self.model = self.model.half()
-                    logger.info("RTMPose model converted to FP16 for faster inference")
-            except Exception as e:
-                logger.warning(f"Could not enable FP16: {e}")
-            
-            # Compile model for PyTorch 2.0+ (can give 10-20% speedup)
-            try:
-                if hasattr(torch, 'compile') and device == "cuda":
-                    self.model = torch.compile(self.model, mode='reduce-overhead')
-                    logger.info("RTMPose model compiled with torch.compile")
-            except Exception as e:
-                logger.debug(f"Could not compile model (this is optional): {e}")
-            
-            # Ensure we are in eval mode for inference (no dropout/BN updates)
-            try:
-                self.model.eval()
-            except Exception as e:
-                logger.debug(f"Could not set model to eval mode (safe to ignore): {e}")
+                self.model = torch.compile(self.model, mode="reduce-overhead")
+                logger.info("RTMPose compiled with torch.compile")
+            except Exception:
+                pass
 
-        finally:
-            # Restore original torch.load
-            torch.load = original_torch_load
-        
-        logger.info("RTMPose model successfully loaded")
-
-    def infer(
-        self,
-        frame_bgr: np.ndarray,
-        person_bboxes: Optional[List[List[float]]] = None,
-        auto_detect: bool = True,
-    ) -> List[PoseEstimatorResult]:
-        """
-        Run pose inference on a single frame.
-
-        Args:
-            frame_bgr: Frame in BGR format (OpenCV default).
-            person_bboxes: Optional list of bounding boxes [x1, y1, x2, y2].
-            auto_detect: If True and person_bboxes is None, auto-detect persons using YOLO.
-
-        Returns:
-            List of PoseEstimatorResult for each detected person.
-        """
-        if frame_bgr is None or frame_bgr.size == 0:
-            raise ValueError("Frame is empty or None.")
-
-        height, width = frame_bgr.shape[:2]
-
-        # Auto-detect persons if bboxes not provided
-        if not person_bboxes and auto_detect:
-            try:
-                from worker.inference.person_detector import get_person_detector
-                detector = get_person_detector()
-                detected_bboxes = detector.detect(frame_bgr)
-                if detected_bboxes:
-                    person_bboxes = detected_bboxes
-                    logger.debug(f"Auto-detected {len(person_bboxes)} person(s)")
-            except Exception as e:
-                logger.warning(f"Person detection failed, using full frame: {e}")
-                person_bboxes = None
-
-        # Default to a single bbox covering the whole frame if no detections
-        # Format: [x1, y1, x2, y2] as numpy array with shape (4,)
-        if not person_bboxes:
-            person_bboxes = [np.array([0, 0, width - 1, height - 1], dtype=np.float32)]
-
-        # Convert bboxes to numpy arrays if they're lists, ensure shape is (4,)
-        # inference_topdown expects bboxes as numpy array with shape (N, 4) where N is number of persons
-        bboxes_array = []
-        for bbox in person_bboxes:
-            if isinstance(bbox, list):
-                bbox = np.array(bbox, dtype=np.float32)
-            elif not isinstance(bbox, np.ndarray):
-                bbox = np.array(bbox, dtype=np.float32)
-            
-            # Ensure bbox has shape (4,) - [x1, y1, x2, y2]
-            if bbox.shape != (4,):
-                raise ValueError(f"Bbox must have shape (4,), got {bbox.shape}")
-            
-            bboxes_array.append(bbox)
-        
-        # Stack into shape (N, 4) for inference_topdown
-        bboxes_np = np.array(bboxes_array, dtype=np.float32) if bboxes_array else np.array([[0, 0, width - 1, height - 1]], dtype=np.float32)
-
-        # Call inference_topdown - it expects bboxes as numpy array with shape (N, 4)
-        # bbox_format='xyxy' means [x1, y1, x2, y2] format
-        # Use inference_mode/no_grad to disable autograd and speed up inference
-        try:
-            inference_ctx = torch.inference_mode
-        except AttributeError:  # Older PyTorch
-            inference_ctx = torch.no_grad
-
-        with inference_ctx():
-            pose_data_samples: List[PoseDataSample] = inference_topdown(
-                self.model,
-                frame_bgr,
-                bboxes=bboxes_np,
-                bbox_format='xyxy',
-            )
-
-        results: List[PoseEstimatorResult] = []
-        for sample in pose_data_samples:
-            preds = sample.pred_instances
-            if not hasattr(preds, "keypoints"):
-                continue
-            keypoints = preds.keypoints
-            scores = preds.keypoint_scores if hasattr(preds, "keypoint_scores") else None
-
-            # Some configs return batched predictions. We only handle the first instance per sample.
-            if keypoints.ndim == 3:
-                keypoints = keypoints[0]
-            if scores is not None and scores.ndim == 2:
-                scores = scores[0]
-
-            # Get bbox from predictions or use the input bbox
-            if hasattr(preds, "bboxes") and preds.bboxes is not None and len(preds.bboxes) > 0:
-                bbox = preds.bboxes[0].tolist()
-            else:
-                # Fallback: use the first input bbox
-                bbox = bboxes_np[0].tolist() if len(bboxes_np) > 0 else [0, 0, 0, 0]
-
-            results.append(
-                PoseEstimatorResult(
-                    keypoints=np.asarray(keypoints, dtype=np.float32),
-                    scores=np.asarray(scores, dtype=np.float32)
-                    if scores is not None
-                    else np.zeros(keypoints.shape[0], dtype=np.float32),
-                    bbox=bbox,
-                )
-            )
-
-        return results
+    # ---------------------------------------------------------
+    # FAST BATCH INFERENCE
+    # ---------------------------------------------------------
 
     def infer_batch(
         self,
         frames: List[np.ndarray],
-        person_bboxes_list: Optional[List[Optional[List[List[float]]]]] = None,
+        person_bboxes_list: Optional[List[List[List[float]]]] = None,
         auto_detect: bool = True,
+        max_batch_persons: int = 256,  # kept for API compatibility (unused in per-frame mode)
     ) -> List[List[PoseEstimatorResult]]:
         """
-        Run pose inference on a batch of frames.
-        
-        Args:
-            frames: List of frames in BGR format
-            person_bboxes_list: Optional list of bbox lists (one per frame), or None for all frames
-            auto_detect: If True and bboxes not provided, auto-detect persons
-        
-        Returns:
-            List of lists of PoseEstimatorResult (one list per frame)
+        Fast batched pose inference.
+
+        Returns: List[frame][person]
         """
+
         if not frames:
             return []
 
-        # Safe, version-compatible implementation: just delegate to `infer` per frame.
-        # This keeps all batching decisions (frame grouping, person_bboxes_list) at
-        # the caller level and avoids relying on MMPose multi-image API semantics
-        # that differ across versions.
-        results_batch: List[List[PoseEstimatorResult]] = []
+        # -----------------------------------------------------
+        # Step 1: detect persons (batched)
+        # -----------------------------------------------------
+        if person_bboxes_list is None:
+            if not auto_detect:
+                person_bboxes_list = [None] * len(frames)
+            else:
+                from worker.inference.person_detector import get_person_detector
+                detector = get_person_detector()
+                person_bboxes_list = detector.detect_batch(frames)
 
-        for i, frame_bgr in enumerate(frames):
-            bboxes = person_bboxes_list[i] if person_bboxes_list and i < len(person_bboxes_list) else None
-            frame_results = self.infer(frame_bgr, person_bboxes=bboxes, auto_detect=auto_detect)
-            results_batch.append(frame_results)
+        try:
+            inference_ctx = torch.inference_mode
+        except AttributeError:
+            inference_ctx = torch.no_grad
 
-        return results_batch
+        output = [[] for _ in frames]
 
+        with inference_ctx():
+            # Process each frame independently; this avoids passing a list of
+            # images to `inference_topdown`, which is not supported by some
+            # mmpose versions and leads to `img_path` KeyError in the
+            # loading pipeline.
+            for frame_idx, (frame, persons) in enumerate(
+                zip(frames, person_bboxes_list)
+            ):
+                if frame is None:
+                    continue
+
+                h, w = frame.shape[:2]
+
+                if not persons:
+                    persons = [[0, 0, w - 1, h - 1]]
+
+                frame_bboxes = np.asarray(persons, dtype=np.float32)
+
+                frame_results: List[Optional[PoseDataSample]] = inference_topdown(
+                    self.model,
+                    np.ascontiguousarray(frame),
+                    bboxes=frame_bboxes,
+                    bbox_format="xyxy",
+                )
+
+                for sample in frame_results:
+                    if sample is None:
+                        continue
+
+                    preds = sample.pred_instances
+                    if not hasattr(preds, "keypoints"):
+                        continue
+
+                    keypoints = preds.keypoints
+                    scores = getattr(preds, "keypoint_scores", None)
+
+                    if keypoints.ndim == 3:
+                        keypoints = keypoints[0]
+                    if scores is not None and scores.ndim == 2:
+                        scores = scores[0]
+
+                    if isinstance(keypoints, torch.Tensor):
+                        keypoints = keypoints.cpu().numpy()
+                    if isinstance(scores, torch.Tensor):
+                        scores = scores.cpu().numpy()
+
+                    if hasattr(preds, "bboxes") and preds.bboxes is not None:
+                        bbox = preds.bboxes[0]
+                        bbox = (
+                            bbox.cpu().numpy().tolist()
+                            if isinstance(bbox, torch.Tensor)
+                            else bbox.tolist()
+                        )
+                    else:
+                        bbox = [0, 0, 0, 0]
+
+                    output[frame_idx].append(
+                        PoseEstimatorResult(
+                            keypoints=keypoints.astype(np.float32),
+                            scores=(
+                                scores.astype(np.float32)
+                                if scores is not None
+                                else np.zeros(keypoints.shape[0])
+                            ),
+                            bbox=bbox,
+                        )
+                    )
+
+        return output
+
+
+# ---------------------------------------------------------
+# Singleton loader
+# ---------------------------------------------------------
 
 @lru_cache(maxsize=1)
 def get_pose_estimator() -> PoseEstimator:
-    """
-    Return a singleton PoseEstimator instance.
-
-    Loads RTMPose config + checkpoint paths from settings and caches the instance.
-    """
-    config_path = Path(settings.RTMPOSE_CONFIG_PATH).expanduser().resolve()
-    checkpoint_path = Path(settings.RTMPOSE_CHECKPOINT_PATH).expanduser().resolve()
-    device = settings.DEVICE
-
-    estimator = PoseEstimator(
-        config_path=config_path,
-        checkpoint_path=checkpoint_path,
-        device=device,
+    return PoseEstimator(
+        config_path=Path(settings.RTMPOSE_CONFIG_PATH),
+        checkpoint_path=Path(settings.RTMPOSE_CHECKPOINT_PATH),
+        device=settings.DEVICE,
     )
-    return estimator
-
