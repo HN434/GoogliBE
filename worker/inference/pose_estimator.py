@@ -117,13 +117,13 @@ class PoseEstimator:
         person_bboxes: Optional[List[List[float]]] = None,
         auto_detect: bool = True,
     ) -> List[PoseEstimatorResult]:
-        """Run pose inference on a single frame - optimized."""
+        """Run pose inference on a single frame."""
         if frame_bgr is None or frame_bgr.size == 0:
             return []
 
         h, w = frame_bgr.shape[:2]
 
-        # Auto-detect if needed
+        # Auto-detect persons if needed
         if not person_bboxes and auto_detect:
             try:
                 from worker.inference.person_detector import get_person_detector
@@ -132,16 +132,13 @@ class PoseEstimator:
             except Exception:
                 person_bboxes = None
 
-        # Optimize bbox conversion - avoid repeated array creation
+        # Default to full frame if no bboxes
         if not person_bboxes:
             bboxes_np = np.array([[0, 0, w - 1, h - 1]], dtype=np.float32)
         else:
-            # Pre-allocate array with correct shape
-            bboxes_np = np.asarray(person_bboxes, dtype=np.float32)
-            if bboxes_np.ndim == 1:
-                bboxes_np = bboxes_np.reshape(1, -1)
+            bboxes_np = np.array(person_bboxes, dtype=np.float32)
 
-        # Infer with optimized context
+        # Run inference
         with torch.inference_mode():
             samples: List[PoseDataSample] = inference_topdown(
                 self.model,
@@ -150,7 +147,7 @@ class PoseEstimator:
                 bbox_format="xyxy",
             )
 
-        # Optimized result conversion - reduce allocations
+        # Convert results
         results = []
         for sample in samples:
             preds = sample.pred_instances
@@ -160,46 +157,32 @@ class PoseEstimator:
             keypoints = preds.keypoints
             scores = getattr(preds, "keypoint_scores", None)
 
-            # Handle batched output (take first if batched)
+            # Handle batched output
             if keypoints.ndim == 3:
                 keypoints = keypoints[0]
             if scores is not None and scores.ndim == 2:
                 scores = scores[0]
 
-            # Efficient tensor to numpy conversion (single CPU transfer)
+            # Convert to numpy
             if isinstance(keypoints, torch.Tensor):
-                keypoints = keypoints.detach().cpu().numpy()
-            elif not isinstance(keypoints, np.ndarray):
-                keypoints = np.asarray(keypoints)
-                
-            if scores is not None:
-                if isinstance(scores, torch.Tensor):
-                    scores = scores.detach().cpu().numpy()
-                elif not isinstance(scores, np.ndarray):
-                    scores = np.asarray(scores)
+                keypoints = keypoints.cpu().numpy()
+            if isinstance(scores, torch.Tensor):
+                scores = scores.cpu().numpy()
 
-            # Get bbox efficiently
+            # Get bbox
             if hasattr(preds, "bboxes") and preds.bboxes is not None and len(preds.bboxes) > 0:
-                bbox_tensor = preds.bboxes[0]
-                if isinstance(bbox_tensor, torch.Tensor):
-                    bbox = bbox_tensor.detach().cpu().numpy().tolist()
+                bbox = preds.bboxes[0]
+                if isinstance(bbox, torch.Tensor):
+                    bbox = bbox.cpu().numpy().tolist()
                 else:
-                    bbox = bbox_tensor.tolist() if hasattr(bbox_tensor, 'tolist') else list(bbox_tensor)
+                    bbox = bbox.tolist()
             else:
                 bbox = bboxes_np[0].tolist() if len(bboxes_np) > 0 else [0, 0, 0, 0]
 
-            # Ensure correct dtype without extra copy if possible
-            keypoints_f32 = keypoints.astype(np.float32, copy=False)
-            scores_f32 = (
-                scores.astype(np.float32, copy=False) 
-                if scores is not None 
-                else np.zeros(keypoints.shape[0], dtype=np.float32)
-            )
-
             results.append(
                 PoseEstimatorResult(
-                    keypoints=keypoints_f32,
-                    scores=scores_f32,
+                    keypoints=keypoints.astype(np.float32),
+                    scores=scores.astype(np.float32) if scores is not None else np.zeros(keypoints.shape[0], dtype=np.float32),
                     bbox=bbox,
                 )
             )
@@ -213,125 +196,19 @@ class PoseEstimator:
         auto_detect: bool = True,
     ) -> List[List[PoseEstimatorResult]]:
         """
-        Optimized batch inference - minimizes Python overhead.
-        
-        Processes frames efficiently by:
-        1. Single inference_mode context
-        2. Cached method lookups
-        3. Pre-allocated arrays
-        4. Minimal function calls
+        Simple batch inference - just loops over frames and calls infer().
+        No complex batching, just process each frame individually.
         """
         if not frames:
             return []
 
-        num_frames = len(frames)
-        output = [[] for _ in range(num_frames)]
-        
-        # Cache detector (reduces lookup overhead)
-        detector = None
-        if auto_detect:
-            try:
-                from worker.inference.person_detector import get_person_detector
-                detector = get_person_detector()
-            except Exception:
-                pass
-        
-        # Cache method lookups for speed (reduces Python attribute lookup overhead)
-        hasattr_func = hasattr
-        isinstance_func = isinstance
-        detach_cpu_numpy = lambda t: t.detach().cpu().numpy()
-        
-        # Process all frames in one inference context
-        with torch.inference_mode():
-            for frame_idx in range(num_frames):
-                frame = frames[frame_idx]
-                if frame is None or frame.size == 0:
-                    continue
-                
-                h, w = frame.shape[:2]
-                w1, h1 = w - 1, h - 1
-                
-                # Get bboxes efficiently
-                if person_bboxes_list and frame_idx < len(person_bboxes_list):
-                    bboxes = person_bboxes_list[frame_idx]
-                elif auto_detect and detector:
-                    bboxes = detector.detect(frame)
-                else:
-                    bboxes = None
-                
-                # Fast bbox conversion
-                if not bboxes:
-                    bboxes_np = np.array([[0, 0, w1, h1]], dtype=np.float32)
-                else:
-                    bboxes_np = np.asarray(bboxes, dtype=np.float32)
-                    if bboxes_np.ndim == 1:
-                        bboxes_np = bboxes_np.reshape(1, -1)
-                
-                # Frame already contiguous from video processor, but ensure it
-                if not frame.flags['C_CONTIGUOUS']:
-                    frame = np.ascontiguousarray(frame)
-                
-                # Single GPU call
-                samples = inference_topdown(
-                    self.model,
-                    frame,
-                    bboxes=bboxes_np,
-                    bbox_format="xyxy",
-                )
-                
-                # Fast result conversion - inline everything
-                frame_results = output[frame_idx]
-                frame_results_append = frame_results.append
-                
-                for sample in samples:
-                    preds = sample.pred_instances
-                    if not hasattr_func(preds, "keypoints"):
-                        continue
-                    
-                    keypoints = preds.keypoints
-                    scores = getattr(preds, "keypoint_scores", None) if hasattr_func(preds, "keypoint_scores") else None
-                    
-                    # Handle dimensions
-                    if keypoints.ndim == 3:
-                        keypoints = keypoints[0]
-                    if scores is not None and scores.ndim == 2:
-                        scores = scores[0]
-                    
-                    # Fast tensor conversion (single CPU transfer)
-                    if isinstance_func(keypoints, torch.Tensor):
-                        keypoints = detach_cpu_numpy(keypoints)
-                    elif not isinstance_func(keypoints, np.ndarray):
-                        keypoints = np.asarray(keypoints, dtype=np.float32)
-                    
-                    if scores is not None:
-                        if isinstance_func(scores, torch.Tensor):
-                            scores = detach_cpu_numpy(scores)
-                        elif not isinstance_func(scores, np.ndarray):
-                            scores = np.asarray(scores, dtype=np.float32)
-                    
-                    # Fast bbox extraction
-                    if hasattr_func(preds, "bboxes") and preds.bboxes is not None and len(preds.bboxes) > 0:
-                        bbox_t = preds.bboxes[0]
-                        if isinstance_func(bbox_t, torch.Tensor):
-                            bbox = detach_cpu_numpy(bbox_t).tolist()
-                        else:
-                            bbox = bbox_t.tolist() if hasattr_func(bbox_t, 'tolist') else list(bbox_t)
-                    else:
-                        bbox = bboxes_np[0].tolist() if len(bboxes_np) > 0 else [0, 0, 0, 0]
-                    
-                    # Create result - use copy=False when dtype matches
-                    kpts_f32 = keypoints.astype(np.float32, copy=False)
-                    scores_f32 = scores.astype(np.float32, copy=False) if scores is not None else np.zeros(keypoints.shape[0], dtype=np.float32)
-                    
-                    frame_results_append(
-                        PoseEstimatorResult(
-                            keypoints=kpts_f32,
-                            scores=scores_f32,
-                            bbox=bbox,
-                        )
-                    )
-        
-        return output
+        results = []
+        for i, frame in enumerate(frames):
+            bboxes = person_bboxes_list[i] if person_bboxes_list and i < len(person_bboxes_list) else None
+            frame_results = self.infer(frame, person_bboxes=bboxes, auto_detect=auto_detect)
+            results.append(frame_results)
+
+        return results
 
 
 @lru_cache(maxsize=1)
