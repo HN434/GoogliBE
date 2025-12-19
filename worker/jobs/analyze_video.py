@@ -623,7 +623,7 @@ def analyze_video_job(video_id: str):
         
         try:
             # Process frames one at a time, streaming style
-            for frame_num, frame in video_processor.frame_generator(sample_rate=2):
+            for frame_num, frame in video_processor.frame_generator(sample_rate=1):
                 # Process single frame immediately
                 pose_results = pose_estimator.infer(frame, auto_detect=True)
                 
