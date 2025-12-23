@@ -247,7 +247,50 @@ async def get_live_matches():
                         continue  # Try next key
                 
                 response.raise_for_status()
-                data = response.json()
+                
+                # Handle 204 No Content - valid response meaning no live matches
+                if response.status_code == 204:
+                    logging.info("No live matches available (204 No Content)")
+                    data = {"matches": [], "message": "No live matches available"}
+                    # Mark key as successful
+                    key_rotator.mark_key_success(current_key)
+                    
+                    # Cache the empty result
+                    if redis_service.redis_client:
+                        try:
+                            await redis_service.redis_client.set(
+                                LIVE_MATCHES_CACHE_KEY,
+                                json.dumps(data),
+                                ex=LIVE_MATCHES_CACHE_TTL
+                            )
+                        except Exception:
+                            pass
+                    
+                    return JSONResponse(content=data)
+                
+                # Check if response has content before parsing JSON
+                response_text = response.text
+                if not response_text or not response_text.strip():
+                    # Empty response (but not 204) - log and try next key or raise error
+                    logging.warning(f"Empty response from API (status {response.status_code})")
+                    if attempt < max_attempts - 1:
+                        continue  # Try next key
+                    raise HTTPException(
+                        status_code=502,
+                        detail="Live matches provider returned empty response"
+                    )
+                
+                try:
+                    data = response.json()
+                except json.JSONDecodeError as e:
+                    # Invalid JSON response - log and try next key or raise error
+                    logging.error(f"Invalid JSON response from API: {response_text[:200]}")
+                    if attempt < max_attempts - 1:
+                        continue  # Try next key
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"Live matches provider returned invalid JSON: {str(e)}"
+                    )
                 
                 # Mark key as successful
                 key_rotator.mark_key_success(current_key)
